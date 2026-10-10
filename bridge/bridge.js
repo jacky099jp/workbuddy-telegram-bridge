@@ -40,10 +40,11 @@ const TG = `https://api.telegram.org/bot${BOT}`;
 const ALLOW = new Set((CONFIG.allow_chats || []).map(String));
 const REPLY_TIMEOUT = CONFIG.reply_timeout_ms || 600000;
 
-// 待补发讯息最多保留 12 小时、最多尝试 600 次
-// （RATE_LIMITED 期间 Jack 可能长时间占着 Agent，不能因此丢弃讯息）
-const PENDING_MAX_AGE_MS = 12 * 60 * 60 * 1000;
-const PENDING_MAX_TRIES = 600;
+// 待补发讯息最多保留 30 分钟、最多尝试 5 次。
+// 说明：只有「讯息压根没投进网关」才需要补发；一旦投进（run 已创建）就绝不重投，
+// 否则同一句话会在 WorkBuddy 里被处理多次（就是重复讯息的根源）。
+const PENDING_MAX_AGE_MS = 30 * 60 * 1000;
+const PENDING_MAX_TRIES = 5;
 const RATE_LIMIT_BACKOFF_MS = 60 * 1000;
 // 网关端口会随 WorkBuddy 开新窗口/重启而变化 —— 每 5 秒自检 + 每次投递前确认，
 // 让「端口漂移」对使用者完全无感（等同固定端口）
@@ -209,6 +210,8 @@ async function withGateway(fn) {
 
 // 哪些错误属于「暂时性」——值得排队重投（网关没起来 / 密钥还没刷新 / 限流）
 function isTransientErr(e) {
+  // 已成功投进网关的错误（delivered）是「终态」，重试只会造成重复，绝不算可重试
+  if (e && e.delivered) return false;
   const m = (e && e.message) || '';
   return m === 'BAD_SECRET' || m === 'NO_SECRET' || m === 'RATE_LIMITED' ||
     /fetch failed|ECONN|socket|network|aborted|ETIMEDOUT|ECONNRESET|网关返回 5\d\d/i.test(m);
@@ -334,7 +337,16 @@ async function deliver(chatId, userId, text) {
     }
   }
   const runId = await withGateway(() => startRun(chatId, userId, text));
-  return await awaitReply(runId);
+  // 关键：startRun 成功 = 讯息已真正进入 WorkBuddy（run 已创建）。
+  // 此后若取回复失败，绝不能重投 —— 那会在 WorkBuddy 里产生重复的同一条讯息。
+  // 用 delivered 标记把它和「压根没投进去」区分开。
+  try {
+    return await awaitReply(runId);
+  } catch (e) {
+    const err = new Error('回复未取回: ' + ((e && e.message) || ''));
+    err.delivered = true;
+    throw err;
+  }
 }
 
 // ---------- 主流程 ----------
@@ -360,7 +372,11 @@ async function handleMessage(msg) {
     await tgSend(chatId, reply);
     log(`已回复 ${chatId}: ${reply.slice(0, 80)}`);
   } catch (e) {
-    if (isTransientErr(e)) {
+    if (e.delivered) {
+      // 讯息已真正送达并处理，只是回复没取回 —— 绝不重投（会重复）
+      log(`已送达但回复未取回: ${text.slice(0, 40)}`);
+      await tgSend(chatId, '这条我已经收到并处理了，只是回复在回传时丢了。不用重发，结果我稍后直接推给你。');
+    } else if (isTransientErr(e)) {
       // 网关还没就绪：排队，稍后自动补发，绝不丢弃
       pending.push({ chatId, userId, text, at: Date.now(), tries: 1 });
       savePending(pending);
@@ -390,6 +406,12 @@ async function flushPending() {
       log(`补发成功 ${item.chatId}: ${item.text.slice(0, 40)}`);
       removePending(item);
     } catch (e) {
+      if (e.delivered) {
+        // 讯息其实早已投进网关（重投只会造成重复），直接出队，不再重试
+        log(`补发时确认讯息已送达（回复未取回），出队不再重投: ${item.text.slice(0, 40)}`);
+        removePending(item);
+        continue;
+      }
       item.tries = (item.tries || 0) + 1;
       const tooOld = Date.now() - (item.at || 0) > PENDING_MAX_AGE_MS;
       if (!isTransientErr(e) || tooOld || item.tries > PENDING_MAX_TRIES) {

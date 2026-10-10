@@ -1,0 +1,7 @@
+{
+  "bot_token": "在这里填入你从 @BotFather 拿到的 Bot Token",
+  "allow_chats": ["在这里填入允许私聊的 chat id"],
+  "gateway": "http://127.0.0.1:52116",
+  "reply_timeout_ms": 1800000,
+  "note": "allow_chats 为允许的私聊 chat id 列表；只回复这些会话，绝不主动发起讯息。把本文件复制为 config.json 后再填实际值，config.json 不要提交到版本库。"
+}

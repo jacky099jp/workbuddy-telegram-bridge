@@ -1,0 +1,18 @@
+# 本机凭据与运行状态，绝不提交
+config.json
+secret
+secret.bak-*
+*.log
+state.json
+pending.json
+bridge.pid
+gwport
+STOP
+bridge_dir
+bridge.js.bak-*
+
+# 杂项
+.DS_Store
+node_modules/
+__pycache__/
+*.pyc

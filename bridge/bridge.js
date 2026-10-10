@@ -44,7 +44,9 @@ const REPLY_TIMEOUT = CONFIG.reply_timeout_ms || 600000;
 // 说明：只有「讯息压根没投进网关」才需要补发；一旦投进（run 已创建）就绝不重投，
 // 否则同一句话会在 WorkBuddy 里被处理多次（就是重复讯息的根源）。
 const PENDING_MAX_AGE_MS = 30 * 60 * 1000;
-const PENDING_MAX_TRIES = 5;
+const PENDING_MAX_TRIES = 30;
+// 网关端口漂移的窗口期约 5~15 秒，用短间隔快试，别让讯息卡上几分钟
+const PENDING_RETRY_MS = 5000;
 const RATE_LIMIT_BACKOFF_MS = 60 * 1000;
 // 网关端口会随 WorkBuddy 开新窗口/重启而变化 —— 每 5 秒自检 + 每次投递前确认，
 // 让「端口漂移」对使用者完全无感（等同固定端口）
@@ -388,7 +390,12 @@ async function handleMessage(msg) {
           : e.message === 'RATE_LIMITED'
             ? 'WorkBuddy 正在忙（同一时间只跑一个任务；你正在电脑上跟我对话时就会这样）'
             : '本机网关暂时没就绪（WorkBuddy 刚重启或正在启动）';
-      await tgSend(chatId, `提醒：${why}。这条已排队，恢复后会自动补发，不用重发。`);
+      // 只有「WorkBuddy 正忙」值得让 Jack 知道；网关端口抖动已是秒级自愈，不再打扰他
+      if (e.message === 'RATE_LIMITED') {
+        await tgSend(chatId, `WorkBuddy 正在忙（同时只跑一个任务），这条先记着，稍后自动补处理。`);
+      } else {
+        log(`（网关未就绪：${why}，静默排队，不打扰 Jack）`);
+      }
     } else {
       log('处理失败: ' + e.message);
       await tgSend(chatId, '处理出错：' + e.message);
@@ -421,8 +428,8 @@ async function flushPending() {
       } else {
         log(`补发仍失败（${e.message}），保留待重试: ${item.text.slice(0, 40)}`);
         savePending(pending);
-        // 限流（Jack 正占着 Agent）就退避久一点，别把讯息试到放弃
-        await sleep(e.message === 'RATE_LIMITED' ? RATE_LIMIT_BACKOFF_MS : 15000);
+        // 限流（Jack 正占着 Agent）就退避久一点；纯端口抖动则快试，秒级自愈
+        await sleep(e.message === 'RATE_LIMITED' ? RATE_LIMIT_BACKOFF_MS : PENDING_RETRY_MS);
         return;
       }
     }
@@ -476,7 +483,7 @@ async function main() {
       // 先把积压的补发掉（优先回复旧讯息）
       if (pending.length) {
         await flushPending();
-        if (pending.length) { await sleep(10000); continue; }
+        if (pending.length) { await sleep(PENDING_RETRY_MS); continue; }
       }
 
       const updates = await tgGetUpdates(offset, 25);

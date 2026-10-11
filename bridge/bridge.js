@@ -683,6 +683,40 @@ function removePending(item) {
 
 const pending = loadPending();
 
+// ---------- 通道自养：WorkBuddy 死了就自己拉起来 ----------
+// 设计目标（Jack 2026-10-12 定下）：他只在 tele 喊我、没反应才去动电脑。
+// 所以「电脑没人动」时通道必须能自己活。三层自愈：
+//   ① 端口漂移 → 5 秒巡检自动重新定位
+//   ② 密钥更换 → 从 WorkBuddy 进程环境自动收割
+//   ③ WorkBuddy 本体不在 → 直接 open 拉起（本条）
+// 连续 90 秒探不到网关才动手，每 3 分钟最多拉起一次，避免刷屏。
+let gwDownSince = 0;
+let lastWakeAt = 0;
+
+function workbuddyRunning() {
+  try {
+    const out = execFileSync('/usr/bin/pgrep', ['-f', 'WorkBuddy.app/Contents/MacOS/Electron'],
+      { encoding: 'utf8', timeout: 8000 });
+    return out.trim().length > 0;
+  } catch (_) {
+    return false; // pgrep 无匹配 = 没在跑
+  }
+}
+
+async function tryWakeWorkBuddy() {
+  const now = Date.now();
+  if (!gwDownSince) { gwDownSince = now; return; }
+  if (now - gwDownSince < 90000 || now - lastWakeAt < 180000) return;
+  lastWakeAt = now;
+  if (workbuddyRunning()) return; // 在跑只是网关没就绪，等它自己起
+  try {
+    execFileSync('/usr/bin/open', ['-a', 'WorkBuddy'], { timeout: 15000 });
+    log('通道自养：WorkBuddy 不在运行，已自动拉起（等待网关就绪）');
+  } catch (e) {
+    log('通道自养：拉起 WorkBuddy 失败: ' + ((e && e.message) || e));
+  }
+}
+
 async function main() {
   // 启动时先定位网关（端口每次重启会变）
   const found = await resolveGateway();
@@ -740,9 +774,14 @@ async function main() {
           const found = await resolveGateway();
           if (found && found !== GW) {
             GW = found;
+            gwDownSince = 0;
             try { fs.writeFileSync(GW_HINT_FILE, GW.split(':').pop()); } catch (_) {}
             log('网关端口变化，已重新定位到 ' + GW);
+          } else if (!found) {
+            await tryWakeWorkBuddy();
           }
+        } else {
+          gwDownSince = 0;
         }
       }
 

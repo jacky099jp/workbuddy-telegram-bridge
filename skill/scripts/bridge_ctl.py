@@ -69,13 +69,11 @@ def service_state(label):
 
 
 def find_node():
-    cands = [os.environ.get("WORKBUDDY_NODE", "")]
-    cands += ["/opt/homebrew/bin/node", "/usr/local/bin/node"]
-    base = os.path.expanduser("~/.workbuddy/binaries/node/versions")
-    if os.path.isdir(base):
-        for v in sorted(os.listdir(base), reverse=True):
-            cands.append(os.path.join(base, v, "bin", "node"))
-    for cand in cands:
+    for cand in [
+        "/Users/macmini/.workbuddy/binaries/node/versions/22.22.2-6/bin/node",
+        "/Users/macmini/.workbuddy/binaries/node/versions/20.20.1/bin/node",
+        "/usr/local/bin/node", "/opt/homebrew/bin/node",
+    ]:
         if os.path.isfile(cand) and os.access(cand, os.X_OK):
             return cand
     for p in os.environ.get("PATH", "").split(":"):
@@ -145,6 +143,33 @@ def check_pending(bridge):
     return len(arr), [str(x.get("text", ""))[:30] for x in arr if isinstance(x, dict)]
 
 
+def check_heartbeat(bridge):
+    """读桥接心跳，判断主循环是否还活着。
+
+    背景（2026-10-11）：桥接进程活着、但主循环卡死时，之前 status 全绿却收不到
+    任何消息。现在桥接每轮循环写心跳，这里据此判断。
+
+    返回 (status, idle_seconds, busy_seconds)：
+      'ok'    空闲且心跳新鲜
+      'busy'  正在处理一条消息（耗时正常，不算故障）
+      'stale' 疑似卡死（空闲但心跳太旧）
+      'old'   旧版桥接还没写心跳
+    """
+    hb = os.path.join(bridge, "heartbeat")
+    if not os.path.isfile(hb):
+        return "old", None, None
+    try:
+        with open(hb, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        age = time.time() - float(data.get("t", 0)) / 1000.0
+        state = data.get("state", "idle")
+    except Exception:
+        return "old", None, None
+    if state == "busy":
+        return "busy", None, max(0.0, age)
+    return ("ok" if age < 90 else "stale"), max(0.0, age), None
+
+
 def cmd_status(bridge):
     print("=" * 46)
     print(" tele 通道体检")
@@ -172,6 +197,18 @@ def cmd_status(bridge):
     n, items = check_pending(bridge)
     print("待补发      %d 条%s" % (n, ("：" + " / ".join(items)) if items else ""))
 
+    cfg = C.load_config(bridge)
+    timeout_s = (cfg.get("reply_timeout_ms") or 1800000) / 1000.0
+    hb_state, idle_age, busy_age = check_heartbeat(bridge)
+    if hb_state == "old":
+        print("主循环心跳  --（此版本桥接未写心跳）")
+    elif hb_state == "busy":
+        print("主循环心跳  正在处理消息（已 %.0f 秒）" % busy_age)
+    elif hb_state == "ok":
+        print("主循环心跳  %.0f 秒前（正常）" % idle_age)
+    else:
+        print("主循环心跳  ★ %.0f 秒无动静（疑似卡死 → 跑 refresh）" % idle_age)
+
     logs = os.path.join(bridge, "bridge.log")
     if os.path.isfile(logs):
         try:
@@ -183,7 +220,6 @@ def cmd_status(bridge):
         except Exception:
             pass
 
-    cfg = C.load_config(bridge)
     print("-- 配置 --")
     print("  网关        %s" % cfg.get("gateway"))
     print("  允许会话    %s" % cfg.get("allow_chats"))
@@ -199,6 +235,8 @@ def cmd_status(bridge):
         problems.append("密钥%s" % ("需刷新" if sev == "stale" else "缺失"))
     if not alive:
         problems.append("防睡眠未开")
+    if hb_state == "stale" or (hb_state == "busy" and busy_age and busy_age > timeout_s + 60):
+        problems.append("主循环疑似卡死（%.0f 秒无心跳）" % (busy_age or idle_age or 0))
     if problems:
         print("需要处理：" + "、".join(problems))
         return 1
@@ -382,8 +420,7 @@ def cmd_restart(bridge):
 def cmd_refresh(bridge):
     env = (os.environ.get("CODEBUDDY_GATEWAY_PASSWORD") or "").strip()
     if not env:
-        print("环境变量 CODEBUDDY_GATEWAY_PASSWORD 为空 —— 当前不在 WorkBuddy 会话内，"
-              "只能等每小时守护任务刷新。")
+        print("环境变量 CODEBUDDY_GATEWAY_PASSWORD 为空 —— 桥接会自行从 WorkBuddy 进程收割密钥，无需处理。")
     else:
         path = os.path.join(bridge, "secret")
         with open(path, "w", encoding="utf-8") as fh:
@@ -404,9 +441,16 @@ def cmd_refresh(bridge):
         print("★ 未能定位本机网关（WorkBuddy 可能没开）。")
 
     C.remember_bridge_dir(bridge)
+    # 【铁律】健康就绝不重启桥接——每次重启都会打断在途消息并制造空窗。
+    # 桥接已自带三层自愈（端口 5 秒重定位、密钥自动收割、WorkBuddy 死亡自动拉起），
+    # 例行维护只应「查」，只有确认不健康才允许动。
+    healthy, detail = check_gateway(bridge)
+    if healthy:
+        print("网关健康（%s），桥接不重启（避免打断在途消息）。" % detail)
+        return 0
     if pgrep_bridge():
         launchctl("kickstart", "-k", "gui/%d/%s" % (os.getuid(), LABEL_BRIDGE))
-        print("已重启桥接。")
+        print("网关不健康（%s），已重启桥接。" % detail)
     healthy, detail = check_gateway(bridge)
     print("刷新后网关：%s（%s）" % ("健康" if healthy else "仍不通", detail))
     return 0 if healthy else 1

@@ -304,8 +304,28 @@ function isTransientErr(e) {
 // 而云端看到消息已被领走（taken），以为本机在处理，就不介入了。
 // 结果：Jack 一条回复都收不到。所以管道不通时，宁可什么都不做，让云端顶上。
 let lastSkipLogAt = 0;
+// 断线感知：gwDownSince（网关开始不通的时刻，0=通）由下方「通道自养」区块统一持有；
+// 这里只负责「恢复后通知用户」，与自养共用同一状态，恢复时清零。
+let gwNotifyAt = 0;
+const RECOVER_NOTIFY_MIN_MS = 60 * 1000;   // 中断超过 60 秒才值得通知
+const RECOVER_NOTIFY_GAP_MS = 10 * 60 * 1000; // 恢复通知至少间隔 10 分钟
+async function notifyRecoverIfDue() {
+  if (!gwDownSince) return;
+  const downMs = Date.now() - gwDownSince;
+  gwDownSince = 0;
+  if (downMs < RECOVER_NOTIFY_MIN_MS || Date.now() - gwNotifyAt < RECOVER_NOTIFY_GAP_MS) return;
+  gwNotifyAt = Date.now();
+  const mins = Math.round(downMs / 60000 * 10) / 10;
+  for (const chatId of ALLOW) {
+    try {
+      await tgSend(chatId, `✅ 通道已恢复（刚才断了约 ${mins} 分钟，已自动接回）——这条就是验证，有事直接说。`);
+    } catch (_) { /* 通知失败不碍主流程 */ }
+  }
+  log(`通道已恢复（中断 ${mins} 分钟），已通知用户`);
+}
 async function cloudGetUpdates(timeoutSec) {
   if (!(await probeHealth(GW))) {
+    if (!gwDownSince) gwDownSince = Date.now();
     if (Date.now() - lastSkipLogAt > 60000) {
       lastSkipLogAt = Date.now();
       log('本机网关不通，本轮不去云端取信（交给云端自己答）');
@@ -313,6 +333,7 @@ async function cloudGetUpdates(timeoutSec) {
     await sleep(15000);
     return [];
   }
+  await notifyRecoverIfDue();
 
   let wait = Number(timeoutSec) || 20;
   wait = Math.max(1, Math.min(wait, 25));

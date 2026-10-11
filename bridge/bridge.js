@@ -34,11 +34,46 @@ const STATE_FILE = path.join(DIR, 'state.json');
 const PENDING_FILE = path.join(DIR, 'pending.json');
 const LOG_FILE = path.join(DIR, 'bridge.log');
 const STOP_FILE = path.join(DIR, 'STOP');
+const HEARTBEAT_FILE = path.join(DIR, 'heartbeat');
+
+// 心跳：供 bridge_ctl.py status 判断「主循环是否还活着」。
+// 2026-10-11 教训：进程还活着、但主循环卡死时，status 曾经完全看不出问题
+// （所有检查项都正常，实际消息已经收不进来）。
+function beat(state) {
+  try {
+    fs.writeFileSync(HEARTBEAT_FILE, JSON.stringify({ t: Date.now(), state }));
+  } catch (_) {}
+}
 
 const BOT = CONFIG.bot_token;
 const TG = `https://api.telegram.org/bot${BOT}`;
 const ALLOW = new Set((CONFIG.allow_chats || []).map(String));
 const REPLY_TIMEOUT = CONFIG.reply_timeout_ms || 600000;
+
+// ---------- 云端模式（2026-10-11 新增）----------
+// 云端小姚持有 Telegram 的 webhook，本机改成「向云端领消息 / 把回复交给云端发」。
+// 目的：本机重启换端口、密钥过期都不再影响收信；本机不在线时云端自己顶上。
+// 开关在 config.json 的 cloud 字段；关掉即回到直连 getUpdates，可秒回滚。
+const CLOUD = CONFIG.cloud || {};
+const CLOUD_MODE = !!CLOUD.enabled && !!CLOUD.url;
+const CLOUD_URL = String(CLOUD.url || '').replace(/\/+$/, '');
+const CLOUD_KEY = CLOUD.key || '';
+
+// Cloudflare 会拦掉默认的机器人 UA（node/python 一律返回 error 1010），
+// 所以每次请求云端都必须自带一个明确标识，否则连健康检查都过不去。
+function cloudHeaders(extra) {
+  return Object.assign({
+    'user-agent': 'yao-bridge/1.0',
+    'x-yao-key': CLOUD_KEY,
+  }, extra || {});
+}
+
+// 排队回执节流。
+// 2026-10-11 教训：网关未就绪时「静默排队」会让 Jack 完全不知道消息去哪了 ——
+// 他只看到自己一条条发出去、没有任何回应，体感就是「tele 挂了」。
+// 现在改为：排队时至少回执一次，让他知道消息已被接住；但 3 分钟内最多一条，不刷屏。
+const QUEUE_NOTICE_GAP_MS = 3 * 60 * 1000;
+let lastQueueNoticeAt = 0;
 
 // 待补发讯息最多保留 30 分钟、最多尝试 5 次。
 // 说明：只有「讯息压根没投进网关」才需要补发；一旦投进（run 已创建）就绝不重投，
@@ -48,6 +83,13 @@ const PENDING_MAX_TRIES = 30;
 // 网关端口漂移的窗口期约 5~15 秒，用短间隔快试，别让讯息卡上几分钟
 const PENDING_RETRY_MS = 5000;
 const RATE_LIMIT_BACKOFF_MS = 60 * 1000;
+
+// 云端来的消息：本机投递失败时给几个短窗口再试。
+// WorkBuddy 常常只是「正忙一下」，几秒后就有空档 —— 能接就本机答（能力全、答案好），
+// 实在接不了才放手让云端兜底。总等待必须明显短于云端的兜底时限（60 秒），
+// 否则云端兜底先触发，这条又被本机答一次，Jack 会收到两份回答。
+const CLOUD_HANDOFF_RETRIES = 2;
+const CLOUD_HANDOFF_GAP_MS = 15 * 1000;
 // 网关端口会随 WorkBuddy 开新窗口/重启而变化 —— 每 5 秒自检 + 每次投递前确认，
 // 让「端口漂移」对使用者完全无感（等同固定端口）
 const GW_CHECK_MS = 5 * 1000;
@@ -58,7 +100,7 @@ let GW = CONFIG.gateway || 'http://127.0.0.1:52116';
 // ---------- 基础工具 ----------
 
 function log(...args) {
-  const line = `[${new Date().toISOString()}] ${args.join(' ')}`;
+  const line = `[${new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })}] ${args.join(' ')}`;
   console.log(line);
   try {
     if (fs.existsSync(LOG_FILE) && fs.statSync(LOG_FILE).size > 2 * 1024 * 1024) {
@@ -83,14 +125,46 @@ function writeSecretFile(s) {
 }
 
 // 尝试自愈通道密钥。
-// 实测：macOS 不允许同用户进程读取别的进程环境变量（ps eww 拿不到 Electron 的 env），
-// 而 WorkBuddy 每次启动重生成的网关密码只存在于其进程环境变量里、不落盘 ——
-// 所以桥接（launchd 启动）无法自行取回。可行的自愈路径只有一条：
-// 先看自身 env（若桥接是被 WorkBuddy 拉起的就有效），否则等每小时守护刷新写回 secret 文件。
-// 关键配套：密钥过期期间讯息会一直排队（BAD_SECRET 退避重试，不丢弃），刷新后自动补发。
+// 2026-10-12 修正：实测 `ps eww -p <WorkBuddy主进程>` **可以**读到进程环境变量里的
+// CODEBUDDY_GATEWAY_PASSWORD（旧注释说读不到是错的，已用 pid 实测验证）。
+// 于是 WorkBuddy 重启 → 密钥更换后，桥接能在下一个巡检周期（≤5 秒）自己收割新密钥，
+// 不再依赖每小时守护自动化 —— 之前最长 1 小时的空窗由此消除。
+function harvestGatewayEnv() {
+  try {
+    const pids = execFileSync('/usr/bin/pgrep', ['-f', 'WorkBuddy.app/Contents/MacOS/Electron'],
+      { encoding: 'utf8', timeout: 8000 }).split(/\s+/).filter((p) => p);
+    for (const pid of pids) {
+      try {
+        const out = execFileSync('/bin/ps', ['eww', '-p', pid], { encoding: 'utf8', timeout: 8000 });
+        const sm = out.match(/CODEBUDDY_GATEWAY_PASSWORD=(\S+)/);
+        if (!sm) continue;
+        const secret = sm[1].replace(/\0/g, '').trim();
+        if (!secret) continue;
+        const pm = out.match(/SERVER__PORT=(\d{2,5})/);
+        return { secret, port: pm ? pm[1] : null };
+      } catch (_) { /* 下一个 pid */ }
+    }
+  } catch (_) { /* pgrep 失败 */ }
+  return null;
+}
+
 function tryRefreshSecret() {
   const envSecret = (process.env.CODEBUDDY_GATEWAY_PASSWORD || '').trim();
   if (envSecret) { writeSecretFile(envSecret); return envSecret; }
+  const h = harvestGatewayEnv();
+  if (h && h.secret) {
+    let cur = '';
+    try { cur = fs.readFileSync(SECRET_FILE, 'utf8').trim(); } catch (_) {}
+    if (h.secret !== cur) {
+      writeSecretFile(h.secret);
+      log('通道密钥已自动从 WorkBuddy 进程收割（长度 ' + h.secret.length + '，与旧的不同）');
+      if (h.port) {
+        try { fs.writeFileSync(GW_HINT_FILE, h.port); } catch (_) {}
+        log('同时取得网关端口提示: ' + h.port);
+      }
+    }
+    return h.secret;
+  }
   return null;
 }
 
@@ -221,7 +295,106 @@ function isTransientErr(e) {
 
 // ---------- Telegram ----------
 
+// 云端模式：向云端小姚领消息。
+// 同一个 bot 不能同时 webhook + 长轮询，所以上云以后收信统一走云端，本机不再直连。
+//
+// 【重要】领信之前先确认本机管道是通的。
+// 反例（2026-10-11 发现的设计缺陷）：电脑开着、但 WorkBuddy 关掉了 ——
+// 桥接照样把消息从云端领走，投给本机网关必然失败，消息进 pending 反复重投直到被丢弃；
+// 而云端看到消息已被领走（taken），以为本机在处理，就不介入了。
+// 结果：Jack 一条回复都收不到。所以管道不通时，宁可什么都不做，让云端顶上。
+let lastSkipLogAt = 0;
+async function cloudGetUpdates(timeoutSec) {
+  if (!(await probeHealth(GW))) {
+    if (Date.now() - lastSkipLogAt > 60000) {
+      lastSkipLogAt = Date.now();
+      log('本机网关不通，本轮不去云端取信（交给云端自己答）');
+    }
+    await sleep(15000);
+    return [];
+  }
+
+  let wait = Number(timeoutSec) || 20;
+  wait = Math.max(1, Math.min(wait, 25));
+  const res = await fetch(`${CLOUD_URL}/poll?wait=${wait}`, {
+    headers: cloudHeaders(),
+    signal: AbortSignal.timeout(Math.max(60, wait * 3) * 1000),
+  });
+  let data;
+  try {
+    data = await res.json();
+  } catch (_) {
+    const err = new Error(`云端返回非 JSON（HTTP ${res.status}）`);
+    err.transient = true;
+    throw err;
+  }
+  if (!data.ok) {
+    const err = new Error('云端取信失败: ' + JSON.stringify(data).slice(0, 160));
+    err.transient = true;
+    throw err;
+  }
+  if (!data.msg) return [];
+  const m = data.msg;
+  // 包装成 Telegram update 的形状，主循环后面的处理逻辑一行都不用改
+  return [{
+    update_id: 0,
+    _cloudId: m.id,
+    message: {
+      message_id: m.id,
+      chat: { id: Number(m.chatId) },
+      from: { id: Number(m.userId) },
+      text: m.text,
+    },
+  }];
+}
+
+// 处理完通知云端删掉这条（成功接手才该删；接不了就交给 /handoff）
+async function cloudAck(id) {
+  if (!id) return;
+  try {
+    await fetch(`${CLOUD_URL}/ack?id=${encodeURIComponent(id)}`, {
+      method: 'POST',
+      headers: cloudHeaders(),
+      signal: AbortSignal.timeout(10000),
+    });
+  } catch (_) {}
+}
+
+// 主动交棒：本机明确接不了这条，请云端立刻代答。
+// 以前是「什么都不做，等云端超时兜底」，Jack 要白等一分钟，还可能撞出双份回答。
+async function cloudHandoff(id) {
+  if (!id) return;
+  try {
+    const res = await fetch(`${CLOUD_URL}/handoff?id=${encodeURIComponent(id)}`, {
+      method: 'POST',
+      headers: cloudHeaders(),
+      signal: AbortSignal.timeout(90000),
+    });
+    const d = await res.json().catch(() => ({}));
+    log('已交棒给云端：' + JSON.stringify(d).slice(0, 120));
+  } catch (e) {
+    log('交棒请求失败（云端会自行兜底）: ' + ((e && e.message) || e));
+  }
+}
+
+// 启动时把云端「已被本机取走、但没处理完」的消息放回队列。
+// 本机重启 = 上一次处理必然半途而废，不捞回来它会卡在 taken 里干等 45 分钟。
+async function cloudRecover() {
+  try {
+    const res = await fetch(`${CLOUD_URL}/recover`, {
+      method: 'POST',
+      headers: cloudHeaders(),
+      signal: AbortSignal.timeout(15000),
+    });
+    const d = await res.json();
+    if (d.ok && d.recovered) log(`云端捞回 ${d.recovered} 条中断的消息，稍后重投`);
+  } catch (e) {
+    log('云端捞回失败（不影响启动）: ' + ((e && e.message) || e));
+  }
+}
+
 async function tgGetUpdates(offset, timeoutSec) {
+  if (CLOUD_MODE) return cloudGetUpdates(timeoutSec);
   const url =
     `${TG}/getUpdates?offset=${offset}&timeout=${timeoutSec}` +
     `&allowed_updates=${encodeURIComponent(JSON.stringify(['message']))}`;
@@ -238,7 +411,25 @@ async function tgGetUpdates(offset, timeoutSec) {
   return data.result || [];
 }
 
+// 云端模式：回复也交给云端发（云端持有 bot token，本机不再直接调 Telegram）
+async function cloudSend(chatId, text) {
+  const res = await fetch(`${CLOUD_URL}/reply`, {
+    method: 'POST',
+    headers: cloudHeaders({ 'content-type': 'application/json' }),
+    body: JSON.stringify({ chat_id: String(chatId), text }),
+    signal: AbortSignal.timeout(30000),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.ok) {
+    const err = new Error('云端 sendMessage 失败: ' + JSON.stringify(data).slice(0, 200));
+    err.transient = res.status >= 500 || res.status === 429;
+    throw err;
+  }
+  return data.result;
+}
+
 async function tgSend(chatId, text) {
+  if (CLOUD_MODE) return cloudSend(chatId, text);
   const body = new URLSearchParams({ chat_id: String(chatId), text });
   const res = await fetch(`${TG}/sendMessage`, {
     method: 'POST',
@@ -353,13 +544,15 @@ async function deliver(chatId, userId, text) {
 
 // ---------- 主流程 ----------
 
-async function handleMessage(msg) {
+// 返回 true = 本机已接手（云端可以删记录了）
+// 返回 false = 本机接不了（云端请收回兜底，千万别删）
+async function handleMessage(msg, cloudId) {
   const chatId = msg.chat && msg.chat.id;
   const userId = (msg.from && msg.from.id) || chatId;
   const text = (msg.text || '').trim();
   if (!text) {
     await tgSend(chatId, '（目前只处理文字讯息。）');
-    return;
+    return true;
   }
   log(`收到 ${chatId}: ${text.slice(0, 80)}`);
 
@@ -369,19 +562,56 @@ async function handleMessage(msg) {
     const reply = await deliver(chatId, userId, text);
     if (!reply) {
       await tgSend(chatId, '（处理完成，但这次没有产出文字回复。）');
-      return;
+      return true;
     }
     await tgSend(chatId, reply);
     log(`已回复 ${chatId}: ${reply.slice(0, 80)}`);
+    return true;
   } catch (e) {
     if (e.delivered) {
       // 讯息已真正送达并处理，只是回复没取回 —— 绝不重投（会重复）
       log(`已送达但回复未取回: ${text.slice(0, 40)}`);
       await tgSend(chatId, '这条我已经收到并处理了，只是回复在回传时丢了。不用重发，结果我稍后直接推给你。');
+      return true;
     } else if (isTransientErr(e)) {
-      // 网关还没就绪：排队，稍后自动补发，绝不丢弃
-      pending.push({ chatId, userId, text, at: Date.now(), tries: 1 });
-      savePending(pending);
+      // 云端来的消息，本机接不了时绝不能自己攥着不放：
+      // 攥着的话，云端会以为「本机正在处理」而不再介入，Jack 就永远等不到回复。
+      // 一律不 ack，让云端 90 秒后收回自己答（2026-10-11 事故根因）。
+      if (cloudId) {
+        // 先给本机几个短窗口：WorkBuddy 常常只是「正忙一下」，几秒后就有空档。
+        // 能接就本机答（能力全、答案质量高）；接不了就主动交棒给云端，别让 Jack 干等。
+        for (let i = 1; i <= CLOUD_HANDOFF_RETRIES; i++) {
+          await sleep(CLOUD_HANDOFF_GAP_MS);
+          try {
+            const r2 = await deliver(chatId, userId, text);
+            await tgSend(chatId, r2 || '（处理完成，但这次没有产出文字回复。）');
+            log(`第 ${i} 次重试成功，由本机回答: ${text.slice(0, 30)}`);
+            return true;
+          } catch (e2) {
+            if (e2.delivered) {
+              log(`重试时确认已送达（回复未取回），不再重投: ${text.slice(0, 40)}`);
+              await tgSend(chatId, '这条我已经收到并处理了，只是回复在回传时丢了。不用重发，结果我稍后直接推给你。');
+              return true;
+            }
+            if (!isTransientErr(e2)) return true;
+            log(`第 ${i} 次重试仍受阻（${e2.message}）: ${text.slice(0, 30)}`);
+          }
+        }
+        log(`本机接不了，主动交棒给云端: ${text.slice(0, 40)}`);
+        await cloudHandoff(cloudId);
+        return false;
+      }
+      // 网关还没就绪：排队，稍后自动补发，绝不丢弃。
+      // 同一句话 10 分钟内只留一条：他着急时会连发同样的问话，
+      // 不去重的话队列里会有多个副本，WorkBuddy 侧就被重复处理、重复回复。
+      const dup = pending.find((p) => p.chatId === chatId && p.text === text &&
+                                     Date.now() - (p.at || 0) < 10 * 60 * 1000);
+      if (dup) {
+        log(`同一条消息已在队列中，不重复排队: ${text.slice(0, 40)}`);
+      } else {
+        pending.push({ chatId, userId, text, at: Date.now(), tries: 1 });
+        savePending(pending);
+      }
       log(`投递受阻（${e.message}），已排队待补发: ${text.slice(0, 40)}`);
       const why = e.message === 'BAD_SECRET'
         ? '通道密钥刚好过期（WorkBuddy 重启后会重生成，桥接会自动取回）'
@@ -390,15 +620,19 @@ async function handleMessage(msg) {
           : e.message === 'RATE_LIMITED'
             ? 'WorkBuddy 正在忙（同一时间只跑一个任务；你正在电脑上跟我对话时就会这样）'
             : '本机网关暂时没就绪（WorkBuddy 刚重启或正在启动）';
-      // 只有「WorkBuddy 正忙」值得让 Jack 知道；网关端口抖动已是秒级自愈，不再打扰他
-      if (e.message === 'RATE_LIMITED') {
-        await tgSend(chatId, `WorkBuddy 正在忙（同时只跑一个任务），这条先记着，稍后自动补处理。`);
-      } else {
-        log(`（网关未就绪：${why}，静默排队，不打扰 Jack）`);
+      // 不再静默排队：让 Jack 知道消息已被接住（3 分钟最多一条，避免刷屏）
+      log(`（排队待补发：${why}）`);
+      if (Date.now() - lastQueueNoticeAt > QUEUE_NOTICE_GAP_MS) {
+        lastQueueNoticeAt = Date.now();
+        await tgSend(chatId, e.message === 'RATE_LIMITED'
+          ? '这条我先收着。WorkBuddy 正在忙（同一时间只跑一个任务），空出来就处理。'
+          : '这条我先收着。本机通道刚好在重启/抖动，稍后自动补处理。');
       }
+      return true;
     } else {
       log('处理失败: ' + e.message);
       await tgSend(chatId, '处理出错：' + e.message);
+      return true;
     }
   }
 }
@@ -428,8 +662,13 @@ async function flushPending() {
       } else {
         log(`补发仍失败（${e.message}），保留待重试: ${item.text.slice(0, 40)}`);
         savePending(pending);
-        // 限流（Jack 正占着 Agent）就退避久一点；纯端口抖动则快试，秒级自愈
-        await sleep(e.message === 'RATE_LIMITED' ? RATE_LIMIT_BACKOFF_MS : PENDING_RETRY_MS);
+        // 退避递增：WorkBuddy 忙（RATE_LIMITED）时投得太密，只会在它那边堆出一串
+        // 重复 run（2026-10-11 实测 25 秒一次、堆了 3 个、同样的问题刷了三次）。
+        // 改成 60s → 120s → …（上限 5 分钟）：既等它空出来，又不重复。
+        // 纯端口抖动仍是 5 秒，秒级自愈。
+        await sleep(e.message === 'RATE_LIMITED'
+          ? Math.min(RATE_LIMIT_BACKOFF_MS * (item.tries || 1), 300 * 1000)
+          : PENDING_RETRY_MS);
         return;
       }
     }
@@ -454,12 +693,39 @@ async function main() {
     log('警告：启动时未能定位本机网关，将在收到讯息时重试定位。');
   }
   log('桥接启动。网关=' + GW + '，允许会话=' + [...ALLOW].join(',') +
-      (pending.length ? `，待补发 ${pending.length} 条` : ''));
+      (pending.length ? `，待补发 ${pending.length} 条` : '') +
+      (CLOUD_MODE ? '，收信走云端' : ''));
+
+  // 云端模式：本机刚重启，先让云端把上次「取了没处理完」的消息放回队列
+  if (CLOUD_MODE) await cloudRecover();
 
   const state = loadState();
   let offset = Number(state.last_update_id || 0) + 1;
   let lastErrAt = 0;
   let lastGwCheck = 0;
+  let flushing = false;          // 补发是否进行中（防并发重入）
+  let lastLoopAt = Date.now();   // 看门狗：主循环最后推进时间
+  let busySince = 0;             // 正在处理一条消息的起始时间（0 = 空闲）
+
+  // 看门狗：主循环若长时间无推进（网络挂起等），主动退出让 launchd 重新拉起。
+  //
+  // 关键修正（2026-10-11）：处理消息时主循环是「故意」停住的 —— 桥接一次只办一件事，
+  // await handleMessage 期间 lastLoopAt 不会推进。旧写法不区分这两者，于是
+  // 「WorkBuddy 回话慢」被误判成「主循环卡死」→ 240 秒就 process.exit。
+  // 而那一刻消息往往已经被云端取走（taken），进程一死就等于把消息丢了，
+  // 45 分钟后云端才放回队列重投 —— 表现为「同一条消息被回答两次」或「石沉大海」。
+  // 现在：处理中一律豁免，只留一条硬上限（回复超时 + 5 分钟）兜底真卡死。
+  setInterval(() => {
+    if (busySince) {
+      if (Date.now() - busySince <= REPLY_TIMEOUT + 300000) return;
+      log('看门狗：单条消息处理已超过硬上限，退出进程等待重启。');
+      process.exit(1);
+    }
+    if (Date.now() - lastLoopAt > 240000) {
+      log('看门狗：主循环超过 240 秒未推进，退出进程等待 launchd 重启。');
+      process.exit(1);
+    }
+  }, 30000);
 
   while (true) {
     if (fs.existsSync(STOP_FILE)) {
@@ -480,17 +746,29 @@ async function main() {
         }
       }
 
-      // 先把积压的补发掉（优先回复旧讯息）
-      if (pending.length) {
-        await flushPending();
-        if (pending.length) { await sleep(PENDING_RETRY_MS); continue; }
+      // 先把积压的补发掉 —— 但绝不能阻塞接收新讯息。
+      // （旧写法 await flushPending() 后若仍有 pending 就 continue，等于整轮跳过
+      //  tgGetUpdates：一条卡住的补发会把整条通道堵死。2026-10-11 实测主循环曾因此
+      //  静默停摆 4 分钟，新消息全部收不到。）
+      if (pending.length && !flushing) {
+        flushing = true;
+        // 不要用 Promise.race 截断成 10 秒：那会让 flushing 提前复位，
+        // 下一轮循环又启动一个 flushPending，同一个 item 被并发重投。
+        // 2026-10-11 实测：25 秒投一次，同一条消息在 WorkBuddy 里堆出 3 个重复 run，
+        // 刷屏式重投就是这个并发缺陷造成的。退避 sleep 留在 flushPending 内部，
+        // 由 flushing 标志保证同一时间只有一个补发流程在跑。
+        flushPending()
+          .catch((e) => log('补发流程异常: ' + ((e && e.message) || e)))
+          .finally(() => { flushing = false; });
       }
 
       const updates = await tgGetUpdates(offset, 25);
 
       // 关键：先推进并落盘 offset，再处理。避免处理中途重启导致同一条讯息被重复回复。
       // （投递失败会进 pending 队列，所以不会丢。）
-      if (updates.length) {
+      // 云端模式下 update_id 是云端队列的序号，跟 Telegram 的 offset 无关，
+      // 绝不能拿它推进 offset —— 否则切回直连时会错乱，把真实消息挡在门外。
+      if (updates.length && !CLOUD_MODE) {
         for (const u of updates) offset = Math.max(offset, Number(u.update_id) + 1);
         saveState({ last_update_id: offset - 1, updated_at: new Date().toISOString() });
       }
@@ -501,10 +779,22 @@ async function main() {
         const chatId = msg.chat && msg.chat.id;
         if (!ALLOW.has(String(chatId))) {
           log(`忽略非授权会话 ${chatId}`);
+          if (u._cloudId) await cloudAck(u._cloudId);
           continue;
         }
         if (msg.from && msg.from.is_bot) continue;
-        await handleMessage(msg);
+        beat('busy');   // 让体检知道「正在处理消息」，而不是误判成卡死
+        busySince = Date.now();
+        let handled = true;
+        try {
+          handled = await handleMessage(msg, u._cloudId);
+        } finally {
+          busySince = 0;
+          // 只有本机确实接手了才 ack。接不了就必须留住这条记录，
+          // 让云端 90 秒后收回自己回答；否则两边互相以为对方在处理，Jack 永远等不到回复。
+          if (u._cloudId && handled) await cloudAck(u._cloudId);
+          else if (u._cloudId) log('本机未接手，保留给云端兜底（不 ack）');
+        }
       }
     } catch (e) {
       const now = Date.now();
@@ -517,6 +807,8 @@ async function main() {
       }
       await sleep(transient ? 2000 : 5000);
     }
+    lastLoopAt = Date.now();
+    beat('idle');   // 每轮循环末尾刷新心跳
   }
 }
 

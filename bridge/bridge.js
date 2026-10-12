@@ -68,12 +68,142 @@ function cloudHeaders(extra) {
   }, extra || {});
 }
 
+// ---------- LINE 通道（2026-10-12 新增）----------
+// 你 → LINE → Cloudflare Worker 入队 → 本机这里取信 → 处理 → Worker 推回 LINE。
+//
+// 设计上刻意与 tele 完全隔离：LINE 那条线单独 try/catch、单独节流日志，
+// LINE 崩了、卡了、乱回消息，都伤不到 tele 主循环（Jack 的铁律：通道稳定优先）。
+// 配置在 line.json；文件不存在则整条 LINE 功能不启用，不影响任何既有行为。
+let LINE_CFG = null;
+try {
+  LINE_CFG = JSON.parse(fs.readFileSync(path.join(DIR, 'line.json'), 'utf8'));
+} catch (_) { LINE_CFG = null; }
+const LINE_URL = LINE_CFG ? String(LINE_CFG.worker_url || '').replace(/\/+$/, '') : '';
+const LINE_KEY = LINE_CFG ? LINE_CFG.yao_key : '';
+const LINE_POLL_MS = 5000;      // 取信间隔
+let lastLineLogAt = 0;          // LINE 侧日志节流，避免刷屏淹没 tele 日志
+
+function lineLog(msg) {
+  const now = Date.now();
+  if (now - lastLineLogAt < 60000 && !/收到|已回复/.test(msg)) return;
+  lastLineLogAt = now;
+  log('[LINE] ' + msg);
+}
+
+// 【2026-10-12 修】原来是把默认头对象和 opts 一起丢给 Object.assign，
+// 而 opts 里若有 headers 键，Object.assign 会用 opts.headers **整体替换**掉默认头，
+// x-yao-key 就这样被吃掉了。典型症状：/poll 正常（不带 headers）、/reply 必 401
+// （带了 content-type），日志里那句「回推未成功: {"ok":false,"error":"unauthorized"}」就是它。
+// 现在改成显式分层合并：默认头 ← opts.headers，密钥永远在。
+async function lineApi(pathname, opts) {
+  const o = opts || {};
+  const res = await fetch(LINE_URL + pathname, Object.assign({}, o, {
+    headers: Object.assign({
+      'x-yao-key': LINE_KEY,
+      'user-agent': 'yao-bridge/1.0',
+    }, o.headers || {}),
+    signal: AbortSignal.timeout(o.timeout || 25000),
+  }));
+  return res;
+}
+
+// 取一次 LINE 来信并逐条处理完（串行，与 tele 共用一个 Agent）
+async function lineTick() {
+  if (!LINE_URL || !LINE_KEY) return;
+  let items = [];
+  try {
+    const res = await lineApi('/poll');
+    if (!res.ok) { lineLog(`取信失败 HTTP ${res.status}`); return; }
+    const data = await res.json().catch(() => ({}));
+    items = (data && data.items) || [];
+  } catch (e) {
+    lineLog('取信异常: ' + ((e && e.message) || e));
+    return;
+  }
+
+  for (const it of items) {
+    log(`[LINE] 收到 ${it.userId}: ${String(it.text || '').slice(0, 80)}`);
+    enterBusy();
+    let reply = '';
+    let giveUp = false;
+    try {
+      reply = await deliver('line:' + it.userId, it.userId, it.text);
+    } catch (e) {
+      if (e && e.delivered) {
+        // 已投进 WorkBuddy，绝不重投（会重复）
+        reply = '（这条我已经收到并处理了，只是结果回传时丢了。不用重发，我稍后补给你。）';
+      } else {
+        // 没投进去：不 ack，留在队列里下一轮再试（Worker 侧也会把 stale 的退回队列）
+        lineLog(`处理受阻，留在队列稍后重试: ${((e && e.message) || e).slice(0, 80)}`);
+        giveUp = true;
+      }
+    } finally {
+      exitBusy();
+    }
+    if (giveUp) continue;
+
+    if (!reply) reply = '（处理完成，但这次没有产出文字回复。）';
+    try {
+      const res = await lineApi('/reply', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ id: it.id, userId: it.userId, text: reply }),
+      });
+      const d = await res.json().catch(() => ({}));
+      if (d && d.ok) log(`[LINE] 已回复 ${it.userId}: ${reply.slice(0, 60)}`);
+      else lineLog(`回推未成功: ${JSON.stringify(d).slice(0, 120)}`);
+    } catch (e) {
+      lineLog('回推异常: ' + ((e && e.message) || e));
+    }
+  }
+}
+
+// 【2026-10-12】LINE 取信从 tele 主循环里彻底摘出来了。
+// 原来它挂在主循环里，主循环一忙（在跑长任务）取信就跟着停：Worker 侧 lastPoll 冻住、
+// 被判 online:false、消息一直积压（实测 16:16:27~16:22:50 卡了 6 分钟、积压 3 条）。
+// 现在改用独立定时器，两边互不阻塞。真正共用的只剩「同一台电脑上只有一个 Agent」，
+// 那是平台硬限制，绕不过去；但通道本身不会再因为对方忙而饿死。
+let lineBusy = false;   // 防重入：上一轮还没处理完就不开下一轮
+setInterval(async () => {
+  if (!LINE_URL || !LINE_KEY || lineBusy) return;
+  lineBusy = true;
+  try {
+    await lineTick();
+  } catch (e) {
+    lineLog('取信流程异常（已隔离，不影响 tele）: ' + ((e && e.message) || e));
+  } finally {
+    lineBusy = false;
+  }
+}, LINE_POLL_MS);
+
 // 排队回执节流。
 // 2026-10-11 教训：网关未就绪时「静默排队」会让 Jack 完全不知道消息去哪了 ——
 // 他只看到自己一条条发出去、没有任何回应，体感就是「tele 挂了」。
 // 现在改为：排队时至少回执一次，让他知道消息已被接住；但 3 分钟内最多一条，不刷屏。
 const QUEUE_NOTICE_GAP_MS = 3 * 60 * 1000;
 let lastQueueNoticeAt = 0;
+
+// 「正在处理一条消息」的起始时间（0 = 空闲）。
+// 必须放在模块级：tele 主循环与 LINE 取信循环都要读写它，看门狗也靠它豁免误判。
+let busySince = 0;
+
+// 【2026-10-12】tee 主循环与 LINE 取信循环现在各自独立、可能同时在处理消息。
+// 所以「忙」状态必须用**引用计数**，不能用「置 0 清空」：
+// 否则先结束的一方会把还在忙的另一方误标成空闲，看护就会把「正在处理」误判成「卡死」。
+let busyDepth = 0;
+function enterBusy() {
+  busyDepth++;
+  busySince = Date.now();
+  beat('busy');
+  startCloudPing();   // 忙时持续向云端报到，别让它误判本机离线而抢答
+}
+function exitBusy() {
+  busyDepth = Math.max(0, busyDepth - 1);
+  if (busyDepth === 0) {
+    busySince = 0;
+    stopCloudPing();
+  }
+}
 
 // 待补发讯息最多保留 30 分钟、最多尝试 5 次。
 // 说明：只有「讯息压根没投进网关」才需要补发；一旦投进（run 已创建）就绝不重投，
@@ -823,7 +953,9 @@ async function main() {
   let lastGwCheck = 0;
   let flushing = false;          // 补发是否进行中（防并发重入）
   let lastLoopAt = Date.now();   // 看门狗：主循环最后推进时间
-  let busySince = 0;             // 正在处理一条消息的起始时间（0 = 空闲）
+  // busySince 已提到模块级（tele 与 LINE 两条线共用）
+  busySince = 0;
+  let lastLineTick = 0;          // LINE 取信节流计时
 
   // 看门狗：主循环若长时间无推进（网络挂起等），主动退出让 launchd 重新拉起。
   //
@@ -885,6 +1017,7 @@ async function main() {
           .finally(() => { flushing = false; });
       }
 
+      // LINE 取信已移出主循环，改由文件末尾的独立定时器驱动（见 lineTick 之后）。
       const updates = await tgGetUpdates(offset, 25);
 
       // 关键：先推进并落盘 offset，再处理。避免处理中途重启导致同一条讯息被重复回复。
@@ -906,15 +1039,12 @@ async function main() {
           continue;
         }
         if (msg.from && msg.from.is_bot) continue;
-        beat('busy');   // 让体检知道「正在处理消息」，而不是误判成卡死
-        busySince = Date.now();
-        startCloudPing();   // 处理期间持续向云端报到，别让它误判离线而抢答
+        enterBusy();   // 让体检知道「正在处理消息」，而不是误判成卡死
         let handled = true;
         try {
           handled = await handleMessage(msg, u._cloudId);
         } finally {
-          stopCloudPing();
-          busySince = 0;
+          exitBusy();
           // 只有本机确实接手了才 ack。接不了就必须留住这条记录，
           // 让云端 90 秒后收回自己回答；否则两边互相以为对方在处理，Jack 永远等不到回复。
           if (u._cloudId && handled) await cloudAck(u._cloudId);

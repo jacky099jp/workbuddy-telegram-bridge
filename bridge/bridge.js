@@ -499,7 +499,7 @@ async function startRun(chatId, userId, text) {
  * 订阅本次运行的 SSE 流，返回 Agent 的最终回复文本。
  * 事件形如： event: message \n data: {"status":"completed","content":{"markdown":"..."}}
  */
-async function awaitReply(runId) {
+async function awaitReplyOnce(runId) {
   const secret = readSecret();
   const res = await fetch(`${GW}/api/v1/runs/${runId}/stream`, {
     headers: { 'x-access-token': secret, 'x-codebuddy-request': '1' },
@@ -511,6 +511,7 @@ async function awaitReply(runId) {
   let finalText = null;
   let lastPartial = '';
 
+  try {
   for await (const chunk of res.body) {
     buffer += Buffer.from(chunk).toString('utf8');
     let idx;
@@ -535,8 +536,53 @@ async function awaitReply(runId) {
     }
     if (finalText !== null) break;
   }
+  } catch (e) {
+    // 流被中途掐断时，把已经收到的片段带出去，供上层重连或降级使用
+    if (lastPartial) e.partial = lastPartial;
+    throw e;
+  }
   if (finalText === null) finalText = lastPartial;
   return (finalText || '').trim();
+}
+
+// 2026-10-12 实测：这条 SSE 流会被中途掐断 —— 日志里所有「已送达但回复未取回」
+// 都发生在收信后 302~303 秒，非常规律（空闲约 300 秒即断）。
+// 断流时 run 往往还在跑，绝不能就此放弃：重连同一个 runId 继续等。
+// 重连是只读、幂等的，不会在 WorkBuddy 里产生重复消息。
+const REPLY_STREAM_RETRIES = 3;
+const REPLY_STREAM_GAP_MS = 5000;
+
+async function awaitReply(runId) {
+  let lastErr = null;
+  let bestPartial = '';
+  for (let attempt = 1; attempt <= REPLY_STREAM_RETRIES + 1; attempt++) {
+    try {
+      const text = await awaitReplyOnce(runId);
+      if (attempt > 1) log(`重连第 ${attempt - 1} 次后拿到回复（${text.length} 字）`);
+      return text;
+    } catch (e) {
+      lastErr = e;
+      const m = (e && e.message) || '';
+      if (e.partial && e.partial.length > bestPartial.length) bestPartial = e.partial;
+      // Agent 自身报错是终态，重连没有意义
+      if (/Agent 执行失败|BAD_SECRET|NO_SECRET/.test(m)) throw e;
+      if (attempt <= REPLY_STREAM_RETRIES) {
+        log(`回复流中断（第 ${attempt} 次）：${m}；${REPLY_STREAM_GAP_MS / 1000} 秒后重连拉取`);
+        const found = await resolveGateway();
+        if (found && found !== GW) {
+          GW = found;
+          try { fs.writeFileSync(GW_HINT_FILE, GW.split(':').pop()); } catch (_) {}
+          log('重连前重定位网关 -> ' + GW);
+        }
+        await sleep(REPLY_STREAM_GAP_MS);
+      }
+    }
+  }
+  if (bestPartial) {
+    log(`回复流始终未收全，降级发出已收到的片段（${bestPartial.length} 字）`);
+    return bestPartial + '\n\n（这条可能没说完，完整的我稍后补给你。）';
+  }
+  throw lastErr;
 }
 
 // 投递一条讯息并取回回复（网关不可用时抛错）

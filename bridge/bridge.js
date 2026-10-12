@@ -85,7 +85,9 @@ let lastLineLogAt = 0;          // LINE 侧日志节流，避免刷屏淹没 tel
 
 function lineLog(msg) {
   const now = Date.now();
-  if (now - lastLineLogAt < 60000 && !/收到|已回复/.test(msg)) return;
+  // 【2026-10-12】诊断类日志（未取回/受阻/失败…）不能被 60 秒节流吃掉，
+  // 否则「回复为什么丢」永远查不出。
+  if (now - lastLineLogAt < 60000 && !/收到|已回复|未取回|受阻|异常|失败|重试|告警/.test(msg)) return;
   lastLineLogAt = now;
   log('[LINE] ' + msg);
 }
@@ -255,6 +257,9 @@ async function lineTick() {
     } catch (e) {
       if (e && e.delivered) {
         // 已投进 WorkBuddy，绝不重投（会重复）
+        // 【2026-10-12】以前这里只发兜底、不记真因，导致「回复为什么没取回」查不出来。
+        // 现在把原始错误落进 line 日志，下次一看便知。
+        log(`[LINE] 回复未取回，真因：${((e && e.message) || e).slice(0, 220)}`);
         reply = '（这条我已经收到并处理了，只是结果回传时丢了。不用重发，我稍后补给你。）';
       } else {
         // 没投进去：不 ack，留在队列里下一轮再试（Worker 侧也会把 stale 的退回队列）
@@ -942,7 +947,8 @@ async function handleMessage(msg, cloudId) {
   } catch (e) {
     if (e.delivered) {
       // 讯息已真正送达并处理，只是回复没取回 —— 绝不重投（会重复）
-      log(`已送达但回复未取回: ${text.slice(0, 40)}`);
+      // 【2026-10-12】补上真因，否则永远不知道是超时、断流还是 Agent 自身报错。
+      log(`已送达但回复未取回（真因: ${((e && e.message) || e).slice(0, 180)}）: ${text.slice(0, 40)}`);
       await tgSend(chatId, '这条我已经收到并处理了，只是回复在回传时丢了。不用重发，结果我稍后直接推给你。');
       return true;
     } else if (isTransientErr(e)) {
@@ -961,7 +967,7 @@ async function handleMessage(msg, cloudId) {
             return true;
           } catch (e2) {
             if (e2.delivered) {
-              log(`重试时确认已送达（回复未取回），不再重投: ${text.slice(0, 40)}`);
+              log(`重试时确认已送达（回复未取回，真因: ${((e2 && e2.message) || e2).slice(0, 180)}），不再重投: ${text.slice(0, 40)}`);
               await tgSend(chatId, '这条我已经收到并处理了，只是回复在回传时丢了。不用重发，结果我稍后直接推给你。');
               return true;
             }

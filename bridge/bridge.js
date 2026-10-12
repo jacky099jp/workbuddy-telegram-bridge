@@ -543,19 +543,75 @@ async function resolveGateway() {
   return null;
 }
 
-// 先尝试操作，网络类失败则重新定位网关并重试一次
+// 找出「当前活跃会话」的网关端口：取启动时间最新（etimes 最小）的 codebuddy --serve 进程。
+// 【为什么需要】WorkBuddy 每开一个新会话就起一个新的 --serve 进程（随机端口），旧的会被回收。
+// 桥接扫描端口时可能抓到「探测瞬间还活着、投递时已被回收」的旧端口 —— 这就是丢消息的主因。
+// 把 ps 的 etime 转成秒数：'03:12' / '01:02:03' / '2-01:02:03'（macOS 的 ps 没有 etimes）
+function parseEtime(s) {
+  const m = String(s).trim().match(/^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/);
+  if (!m) return null;
+  return (parseInt(m[1] || '0', 10) * 86400) + (parseInt(m[2] || '0', 10) * 3600) +
+    (parseInt(m[3], 10) * 60) + parseInt(m[4], 10);
+}
+
+function newestServeGateway() {
+  try {
+    const out = execFileSync('/bin/ps', ['-eo', 'pid=,etime=,command='], {
+      encoding: 'utf8', timeout: 5000,
+    });
+    let bestPid = null;
+    let bestAge = Infinity;
+    for (const line of out.split('\n')) {
+      if (!/codebuddy --serve/.test(line) || /--prewarm/.test(line)) continue;
+      const m = line.trim().match(/^(\d+)\s+(\S+)\s+(.*)$/);
+      if (!m) continue;
+      const age = parseEtime(m[2]);
+      if (age === null) continue;
+      if (age < bestAge) { bestAge = age; bestPid = m[1]; }
+    }
+    if (!bestPid) return null;
+    const lo = execFileSync('/usr/sbin/lsof', ['-nP', '-a', '-p', bestPid, '-iTCP', '-sTCP:LISTEN'], {
+      encoding: 'utf8', timeout: 5000,
+    });
+    const mm = lo.match(/127\.0\.0\.1:(\d+)\s*\(LISTEN\)/);
+    return mm ? `http://127.0.0.1:${mm[1]}` : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// 先尝试操作，网络类失败则遍历「所有健康网关」逐个重试。
+// 【2026-10-12 加固】原实现只重定位一次，且 resolveGateway() 可能返回同一个刚失效的端口
+// （探测时还活着、投递时已死），导致消息被判 fetch failed 卡在队列里反复重投。
+// 现在：优先锁定「最新启动的会话进程端口」，再依次尝试 hint / 当前 GW / config / 全部监听端口。
 async function withGateway(fn) {
   try {
     return await fn();
   } catch (e) {
-    const msg = (e && e.message) || '';
-    if (/fetch failed|ECONN|socket|network|aborted|EHOSTUNREACH/i.test(msg)) {
-      const found = await resolveGateway();
-      if (found && found !== GW) {
-        GW = found;
-        try { fs.writeFileSync(GW_HINT_FILE, GW.split(':').pop()); } catch (_) {}
-        log('网关端口变化，已重新定位到 ' + GW);
+    const isNet = (m) => /fetch failed|ECONN|socket|network|aborted|EHOSTUNREACH/i.test(m || '');
+    if (!isNet((e && e.message) || '')) throw e;
+
+    const tried = new Set();
+    const candidates = [];
+    const fresh = newestServeGateway();
+    if (fresh) candidates.push(fresh);
+    for (const extra of [readGwHint(), GW, CONFIG.gateway]) if (extra) candidates.push(extra);
+    for (const p of listLocalPorts()) candidates.push(`http://127.0.0.1:${p}`);
+
+    let hops = 0;
+    for (const base of candidates) {
+      if (!base || tried.has(base) || base === GW) continue;
+      tried.add(base);
+      if (!(await probeHealth(base))) continue;
+      GW = base;
+      try { fs.writeFileSync(GW_HINT_FILE, base.split(':').pop()); } catch (_) {}
+      hops++;
+      log(`网关端口变化，重定位到 ${base}，重试投递（第 ${hops} 次）`);
+      try {
         return await fn();
+      } catch (e2) {
+        // 非网络类错误（如网关返回业务报错）说明确实投到了网关 —— 直接抛出，别乱换端口
+        if (!isNet((e2 && e2.message) || '')) throw e2;
       }
     }
     throw e;

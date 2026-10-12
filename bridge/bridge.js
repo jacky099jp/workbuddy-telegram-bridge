@@ -107,6 +107,69 @@ async function lineApi(pathname, opts) {
   return res;
 }
 
+// ---------- 语音转写（2026-10-12 新增）----------
+// 本机常驻 ASR 服务（launchd 标签 com.jacky.asr-server，端口 8791），
+// 模型只在服务启动时加载一次，之后每句转写几秒。
+// 设计原则同 LINE：语音这条线整体 try/catch，ASR 挂了只回一句提示，绝不带崩通道。
+const ASR_URL = process.env.ASR_URL || 'http://127.0.0.1:8791/transcribe';
+
+async function asrTranscribe(buf) {
+  try {
+    const res = await fetch(ASR_URL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/octet-stream' },
+      body: buf,
+      signal: AbortSignal.timeout(120000),
+    });
+    const d = await res.json().catch(() => ({}));
+    if (!d || !d.ok) {
+      log(`[ASR] 转写失败: ${JSON.stringify(d).slice(0, 140)}`);
+      return '';
+    }
+    return String(d.text || '').trim();
+  } catch (e) {
+    log('[ASR] 服务不可达: ' + ((e && e.message) || e));
+    return '';
+  }
+}
+
+// Telegram 语音/音频：getFile → 下载 → 转写
+async function asrFromTelegram(fileId) {
+  try {
+    const r = await fetch(`${TG}/getFile?file_id=${encodeURIComponent(fileId)}`, {
+      signal: AbortSignal.timeout(20000),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!j || !j.ok || !j.result || !j.result.file_path) {
+      log('[ASR] Telegram getFile 失败: ' + JSON.stringify(j).slice(0, 140));
+      return '';
+    }
+    const fr = await fetch(`https://api.telegram.org/file/bot${BOT}/${j.result.file_path}`, {
+      signal: AbortSignal.timeout(60000),
+    });
+    if (!fr.ok) { log(`[ASR] 下载语音失败 HTTP ${fr.status}`); return ''; }
+    const buf = Buffer.from(await fr.arrayBuffer());
+    return await asrTranscribe(buf);
+  } catch (e) {
+    log('[ASR] 取语音异常: ' + ((e && e.message) || e));
+    return '';
+  }
+}
+
+// LINE 语音：本机没有 Channel Token，由 Worker 代取音频（/audio?id=…）
+async function asrFromLine(messageId) {
+  try {
+    const res = await lineApi('/audio?id=' + encodeURIComponent(messageId), { timeout: 30000 });
+    if (!res.ok) { lineLog(`取音频失败 HTTP ${res.status}`); return ''; }
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (!buf.length) { lineLog('取到空音频'); return ''; }
+    return await asrTranscribe(buf);
+  } catch (e) {
+    lineLog('取音频异常: ' + ((e && e.message) || e));
+    return '';
+  }
+}
+
 // 取一次 LINE 来信并逐条处理完（串行，与 tele 共用一个 Agent）
 async function lineTick() {
   if (!LINE_URL || !LINE_KEY) return;
@@ -122,12 +185,49 @@ async function lineTick() {
   }
 
   for (const it of items) {
-    log(`[LINE] 收到 ${it.userId}: ${String(it.text || '').slice(0, 80)}`);
+    let userText = String(it.text || '').trim();
+
+    // 语音消息：由 Worker 代取音频 → 本机转文字 → 走与文字完全相同的路径
+    if (!userText && it.kind === 'audio' && it.messageId) {
+      lineLog(`收到语音 ${it.userId}，正在转文字…`);
+      userText = await asrFromLine(it.messageId);
+      if (!userText) {
+        try {
+          await lineApi('/reply', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              id: it.id, userId: it.userId,
+              text: '（这条语音我没听清，请再发一次，或者直接打字。）',
+            }),
+          });
+        } catch (_) {}
+        continue;
+      }
+      lineLog(`语音转写: ${userText.slice(0, 60)}`);
+    }
+
+    if (!userText) {
+      // 贴图 / 贴纸之类没有文本也没有音频：确认掉，别占着队列
+      try {
+        await lineApi('/reply', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            id: it.id, userId: it.userId,
+            text: '（这条我看不到内容，请用文字或语音。）',
+          }),
+        });
+      } catch (_) {}
+      continue;
+    }
+
+    log(`[LINE] 收到 ${it.userId}: ${userText.slice(0, 80)}`);
     enterBusy();
     let reply = '';
     let giveUp = false;
     try {
-      reply = await deliver('line:' + it.userId, it.userId, it.text);
+      reply = await deliver('line:' + it.userId, it.userId, userText);
     } catch (e) {
       if (e && e.delivered) {
         // 已投进 WorkBuddy，绝不重投（会重复）
@@ -163,15 +263,33 @@ async function lineTick() {
 // 被判 online:false、消息一直积压（实测 16:16:27~16:22:50 卡了 6 分钟、积压 3 条）。
 // 现在改用独立定时器，两边互不阻塞。真正共用的只剩「同一台电脑上只有一个 Agent」，
 // 那是平台硬限制，绕不过去；但通道本身不会再因为对方忙而饿死。
+// 【2026-10-12 补】LINE 侧同款缺陷：一条消息在跑时整轮 lineTick 都忙（lineBusy 直接 early return），
+// 期间不会 /poll，而 worker 的 localOnline() 判据是「90 秒内 poll 过」→ 本机被判成离线。
+// 后果：Jack 在这期间再发一条消息，worker 会先回他一句「【雲端】本機現在沒接上…已排進隊伍」——
+// 他不过是问了一句话，看起来却像通道坏了（实测 17:11 就是这种状态）。
+// 处理期间每 25 秒 /ping 报到（只刷新 poll:last，不动队列），与 tele 侧 startCloudPing 同构。
+let linePingTimer = null;
+function startLinePing() {
+  if (linePingTimer || !LINE_URL || !LINE_KEY) return;
+  linePingTimer = setInterval(() => {
+    lineApi('/ping').catch(() => { /* 报到失败不碍事，主流程照跑 */ });
+  }, 25000);
+}
+function stopLinePing() {
+  if (linePingTimer) { clearInterval(linePingTimer); linePingTimer = null; }
+}
+
 let lineBusy = false;   // 防重入：上一轮还没处理完就不开下一轮
 setInterval(async () => {
   if (!LINE_URL || !LINE_KEY || lineBusy) return;
   lineBusy = true;
+  startLinePing();
   try {
     await lineTick();
   } catch (e) {
     lineLog('取信流程异常（已隔离，不影响 tele）: ' + ((e && e.message) || e));
   } finally {
+    stopLinePing();
     lineBusy = false;
   }
 }, LINE_POLL_MS);
@@ -763,9 +881,24 @@ async function deliver(chatId, userId, text) {
 async function handleMessage(msg, cloudId) {
   const chatId = msg.chat && msg.chat.id;
   const userId = (msg.from && msg.from.id) || chatId;
-  const text = (msg.text || '').trim();
+  let text = (msg.text || '').trim();
+
+  // 语音 / 音频消息：先转成文字，再走与文字完全相同的处理路径。
+  // voice = 按住说话的语音条；audio = 当文件发来的音频；video_note = 圆形视频留言。
+  const media = msg.voice || msg.audio || msg.video_note;
+  if (!text && media && (media.file_id || media.file_unique_id)) {
+    const dur = media.duration ? `（${media.duration}s）` : '';
+    await tgSend(chatId, `收到语音${dur}，正在转成文字…`);
+    text = await asrFromTelegram(media.file_id || media.file_unique_id);
+    if (!text) {
+      await tgSend(chatId, '这条语音我没听清，麻烦再发一次，或者直接打字。');
+      return true;
+    }
+    log(`语音转写: ${text.slice(0, 80)}`);
+  }
+
   if (!text) {
-    await tgSend(chatId, '（目前只处理文字讯息。）');
+    await tgSend(chatId, '（目前只处理文字和语音讯息。）');
     return true;
   }
   log(`收到 ${chatId}: ${text.slice(0, 80)}`);

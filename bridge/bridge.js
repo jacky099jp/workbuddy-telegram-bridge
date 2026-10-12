@@ -170,6 +170,30 @@ async function asrFromLine(messageId) {
   }
 }
 
+// 【2026-10-12 补】投递受阻时不能让 Jack 干等 —— 他只会得出「LINE 又挂了」的结论。
+// 这就是 17:17~17:20 他连发三条「情況說明」的原因：本机在忙、投递 fetch failed 却零回执，
+// 他看不到任何反应，只能一直重发。与 tele 侧排队回执（QUEUE_NOTICE_GAP_MS）同构：
+// 3 分钟最多一条；走 Worker /reply 直推（不经过本机网关，所以本机忙时也发得出去）。
+// 注意：**不带 item id**，即不 ack —— 消息必须留在队列里等下一轮真的处理。
+let lastLineNoticeAt = 0;
+const LINE_NOTICE_GAP_MS = 3 * 60 * 1000;
+async function lineQueueNotice(userId, err) {
+  if (Date.now() - lastLineNoticeAt < LINE_NOTICE_GAP_MS) return;
+  lastLineNoticeAt = Date.now();
+  const m = (err && err.message) || String(err || '');
+  const why = m === 'RATE_LIMITED'
+    ? '我現在在電腦上忙（這台機器同一時間只跑一件事），空出來就處理你這條，不用重發。'
+    : '本機通道剛好在重啟或抖動，你這條我先收著了，稍後會自動補處理，不用重發。';
+  try {
+    const res = await lineApi('/reply', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ userId, text: '【小姚】' + why }),
+    });
+    lineLog(`已推送排队回执（HTTP ${res.status}）`);
+  } catch (_) { /* 回执失败不碍主流程 */ }
+}
+
 // 取一次 LINE 来信并逐条处理完（串行，与 tele 共用一个 Agent）
 async function lineTick() {
   if (!LINE_URL || !LINE_KEY) return;
@@ -235,6 +259,7 @@ async function lineTick() {
       } else {
         // 没投进去：不 ack，留在队列里下一轮再试（Worker 侧也会把 stale 的退回队列）
         lineLog(`处理受阻，留在队列稍后重试: ${((e && e.message) || e).slice(0, 80)}`);
+        await lineQueueNotice(it.userId, e);   // 至少让他知道「收到了，在排队」，而不是零反应
         giveUp = true;
       }
     } finally {

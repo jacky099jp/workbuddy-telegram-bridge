@@ -323,6 +323,23 @@ async function notifyRecoverIfDue() {
   }
   log(`通道已恢复（中断 ${mins} 分钟），已通知用户`);
 }
+// WorkBuddy 是单任务串行：处理一条消息期间，主循环不会再去 /poll。
+// 云端 localOnline() 的判据是「90 秒内有没有 poll 过」，所以本机一忙就会被误判成离线，
+// 云端随即把排队中的新消息抢去自己答（2026-10-12 实测：14:13:29 那条就是这样被云端答掉的，
+// 云端日志原文「代答檢查: 本機離線，改由雲端回答 4」，而本机那一刻正在跑 14:10:50 那条）。
+// 处理期间每 25 秒报到一次，让消息老老实实排队等本机，而不是被轻装版抢着答。
+let cloudPingTimer = null;
+function startCloudPing() {
+  if (cloudPingTimer || !CLOUD_URL) return;
+  cloudPingTimer = setInterval(() => {
+    fetch(`${CLOUD_URL}/ping`, { headers: cloudHeaders(), signal: AbortSignal.timeout(8000) })
+      .catch(() => { /* 报到失败不碍事，主流程照跑 */ });
+  }, 25000);
+}
+function stopCloudPing() {
+  if (cloudPingTimer) { clearInterval(cloudPingTimer); cloudPingTimer = null; }
+}
+
 async function cloudGetUpdates(timeoutSec) {
   if (!(await probeHealth(GW))) {
     if (!gwDownSince) gwDownSince = Date.now();
@@ -891,10 +908,12 @@ async function main() {
         if (msg.from && msg.from.is_bot) continue;
         beat('busy');   // 让体检知道「正在处理消息」，而不是误判成卡死
         busySince = Date.now();
+        startCloudPing();   // 处理期间持续向云端报到，别让它误判离线而抢答
         let handled = true;
         try {
           handled = await handleMessage(msg, u._cloudId);
         } finally {
+          stopCloudPing();
           busySince = 0;
           // 只有本机确实接手了才 ack。接不了就必须留住这条记录，
           // 让云端 90 秒后收回自己回答；否则两边互相以为对方在处理，Jack 永远等不到回复。

@@ -227,6 +227,23 @@ def check_line(bridge, fix=True):
     if not body.get("hasToken"):
         r["notes"].append("worker 侧 LINE_CHANNEL_TOKEN 缺失（无法回推）")
 
+    # 【2026-10-13】额度也一起报：LINE 按收件人数计费（群推 1 条 = 群人数），
+    # 额度耗尽会让「主动推」全部静默失败，属最危险的隐形故障，所以要主动盯。
+    try:
+        stq, bq = http_json(url + "/quota", headers=hdrs, timeout=12)
+        if stq == 200 and isinstance(bq, dict) and bq.get("ok"):
+            total = (bq.get("quota") or {}).get("value")
+            used = (bq.get("consumption") or {}).get("totalUsage")
+            if total is not None and used is not None:
+                total, used = int(total), int(used)
+                r["evidence"]["quota_total"] = total
+                r["evidence"]["quota_used"] = used
+                r["evidence"]["quota_left"] = total - used
+                if total - used <= 40:
+                    r["notes"].append("LINE 推播额度只剩 %d 则（<40），主动推要节制" % (total - used))
+    except Exception:
+        pass
+
     poll_ok = age is not None and age <= LINE_POLL_STALE
     if not poll_ok:
         r["notes"].append("本机取信循环没在跑（lastPoll %s）" % (last_poll or "空"))
@@ -316,6 +333,9 @@ def build_report(res, waited):
     if l["ok"]:
         lines.append("LINE ✅ worker 200（%sms）｜本機取信 %s 秒前｜佇列 %s"
                      % (ev.get("worker_ms"), ev.get("last_poll_age"), ev.get("queue")))
+        if ev.get("quota_left") is not None:
+            lines.append("LINE 推播額度 %d/%d（剩 %d 則；群推 1 條＝群人數，回覆免費）"
+                         % (ev.get("quota_used"), ev.get("quota_total"), ev.get("quota_left")))
     else:
         lines.append("LINE ❌ %s" % "；".join(l["notes"] or ["未知异常"]))
 
@@ -371,8 +391,15 @@ def main():
         txt = build_report(res, wait)
         ok, detail = send_tele(bridge, txt)
         res["tele_send"] = ("成功 " + detail) if ok else ("失败 " + detail)
-        ok2, detail2 = send_line(bridge, txt)
-        res["line_send"] = ("成功 " + detail2) if ok2 else ("失败 " + detail2)
+
+        # 【2026-10-13】LINE 实发要花额度（私聊 1 则），额度紧张时跳过：
+        # 自检的结论 tele 已经送到，LINE 这一跳只是「验证能推」，不值得为它烧额度。
+        left = res["LINE"]["evidence"].get("quota_left")
+        if left is not None and left <= 40:
+            res["line_send"] = "已跳过（LINE 剩额 %s 则，省额度）" % left
+        else:
+            ok2, detail2 = send_line(bridge, txt)
+            res["line_send"] = ("成功 " + detail2) if ok2 else ("失败 " + detail2)
         txt = build_report(res, wait)   # 带上实发结果再落盘/打印
 
     out = json.dumps(res, ensure_ascii=False, indent=1) if as_json else build_report(res, wait)

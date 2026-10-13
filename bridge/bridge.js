@@ -24,6 +24,8 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+// 【2026-10-13】群訊息歸檔的「暫停開關」：這個檔案存在時不歸檔（Jack 說「等全進來再記錄」）。
+const ARCHIVE_PAUSE = '/Users/macmini/WorkBuddy/Claw/records/.pause-group-archive';
 const { execFileSync } = require('child_process');
 
 const DIR = __dirname;
@@ -258,7 +260,7 @@ async function lineTick() {
 
     // 【2026-10-13】群訊息自動歸檔：Jack 把這個群當「記錄事情」的通道。
     // 歸檔放在本機這層（而不是只靠我的會話），就算我這邊忙線或出錯，訊息也不會漏記。
-    if (isGroup) {
+    if (isGroup && !fs.existsSync(ARCHIVE_PAUSE)) {
       try {
         const d = new Date();
         const p2 = (n) => String(n).padStart(2, '0');

@@ -392,14 +392,11 @@ def main():
         ok, detail = send_tele(bridge, txt)
         res["tele_send"] = ("成功 " + detail) if ok else ("失败 " + detail)
 
-        # 【2026-10-13】LINE 实发要花额度（私聊 1 则），额度紧张时跳过：
-        # 自检的结论 tele 已经送到，LINE 这一跳只是「验证能推」，不值得为它烧额度。
-        left = res["LINE"]["evidence"].get("quota_left")
-        if left is not None and left <= 40:
-            res["line_send"] = "已跳过（LINE 剩额 %s 则，省额度）" % left
-        else:
-            ok2, detail2 = send_line(bridge, txt)
-            res["line_send"] = ("成功 " + detail2) if ok2 else ("失败 " + detail2)
+        # 【2026-10-13 23:12 Jack 指示】「測試報告一律去 tele，LINE 回復就不扣，
+        #   以後就這樣、先不主動、保持暢通」→ 自检报告**只发 tele**，LINE 一律不主动推。
+        #   LINE 是否畅通由 check_line 判定（worker /status + 本机取信新鲜度 + 额度），
+        #   不需要靠「实推一发」来验证 —— 那一发是白花的额度。
+        res["line_send"] = "未发（LINE 设为不主动推，2026-10-13 Jack 指示；通道健康已由上方 LINE 行判定）"
         txt = build_report(res, wait)   # 带上实发结果再落盘/打印
 
     out = json.dumps(res, ensure_ascii=False, indent=1) if as_json else build_report(res, wait)

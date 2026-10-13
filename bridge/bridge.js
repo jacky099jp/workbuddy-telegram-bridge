@@ -279,6 +279,21 @@ async function lineTick() {
     if (giveUp) continue;
 
     if (!reply) reply = '（处理完成，但这次没有产出文字回复。）';
+
+    // 【2026-10-13】靜默約定（Jack：群裡只有被叫「小姚」才回應）。
+    // 判斷不該插話時把回覆寫成 [靜默]，本機直接吞掉：不發送、不耗額度，訊息仍照常記錄。
+    // （Worker /reply 也有同款判斷，兩邊都生效；本機這層是為了不白跑一趟。）
+    if (/^\s*\[(靜默|静默|SILENT|silent)\]\s*$/.test(reply)) {
+      log(`${tag}[LINE] 靜默不回應 ${target}: ${userText.slice(0, 40)}`);
+      try {
+        await lineApi('/reply', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: replyBody(reply),
+        });
+      } catch (_) {}
+      continue;
+    }
     try {
       const res = await lineApi('/reply', {
         method: 'POST',

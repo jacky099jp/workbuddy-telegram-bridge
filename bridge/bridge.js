@@ -255,6 +255,32 @@ async function lineTick() {
     }
 
     log(`${tag}[LINE] 收到 ${it.userId}→${target}: ${userText.slice(0, 80)}`);
+
+    // 【2026-10-13】群訊息自動歸檔：Jack 把這個群當「記錄事情」的通道。
+    // 歸檔放在本機這層（而不是只靠我的會話），就算我這邊忙線或出錯，訊息也不會漏記。
+    if (isGroup) {
+      try {
+        const d = new Date();
+        const p2 = (n) => String(n).padStart(2, '0');
+        const ym = `${d.getFullYear()}-${p2(d.getMonth() + 1)}`;
+        const f = path.join('/Users/macmini/WorkBuddy/Claw/records', `LINE群組-${ym}.md`);
+        const stamp =
+          `${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:` +
+          `${p2(d.getMinutes())}:${p2(d.getSeconds())}`;
+        const who =
+          it.userId === 'Uaa393cb8ded525c0c2c0d395393f1aa6'
+            ? 'Jack'
+            : '成員 ' + String(it.userId).slice(0, 12) + '…';
+        if (!fs.existsSync(f)) {
+          fs.mkdirSync(path.dirname(f), { recursive: true });
+          fs.writeFileSync(f, `# LINE 群組紀錄 · ${ym}\n\n`);
+        }
+        fs.appendFileSync(f, `- ${stamp} ${who}：${userText.replace(/\s*\n\s*/g, ' ')}`);
+        fs.appendFileSync(f, '\n');
+      } catch (e) {
+        lineLog('群訊息歸檔失敗: ' + ((e && e.message) || e));
+      }
+    }
     enterBusy();
     let reply = '';
     let giveUp = false;

@@ -26,6 +26,8 @@ const os = require('os');
 const path = require('path');
 // 【2026-10-13】群訊息歸檔的「暫停開關」：這個檔案存在時不歸檔（Jack 說「等全進來再記錄」）。
 const ARCHIVE_PAUSE = '/Users/macmini/WorkBuddy/Claw/records/.pause-group-archive';
+// 成員名冊：userId → 名字（JSON）。有了它，記錄檔就不必只寫一串 id。
+const NAME_BOOK = '/Users/macmini/WorkBuddy/Claw/records/成員名冊.json';
 const { execFileSync } = require('child_process');
 
 const DIR = __dirname;
@@ -269,10 +271,12 @@ async function lineTick() {
         const stamp =
           `${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:` +
           `${p2(d.getMinutes())}:${p2(d.getSeconds())}`;
-        const who =
-          it.userId === 'Uaa393cb8ded525c0c2c0d395393f1aa6'
-            ? 'Jack'
-            : '成員 ' + String(it.userId).slice(0, 12) + '…';
+        let who = '成員 ' + String(it.userId).slice(0, 12) + '…';
+        try {
+          const book = JSON.parse(fs.readFileSync(NAME_BOOK, 'utf8'));
+          if (book && book[it.userId]) who = String(book[it.userId]);
+        } catch (_) {}
+        if (it.userId === 'Uaa393cb8ded525c0c2c0d395393f1aa6') who = 'Jack';
         if (!fs.existsSync(f)) {
           fs.mkdirSync(path.dirname(f), { recursive: true });
           fs.writeFileSync(f, `# LINE 群組紀錄 · ${ym}\n\n`);

@@ -179,7 +179,7 @@ async function asrFromLine(messageId) {
 // 注意：**不带 item id**，即不 ack —— 消息必须留在队列里等下一轮真的处理。
 let lastLineNoticeAt = 0;
 const LINE_NOTICE_GAP_MS = 3 * 60 * 1000;
-async function lineQueueNotice(userId, err) {
+async function lineQueueNotice(target, err, fallbackUserId) {
   if (Date.now() - lastLineNoticeAt < LINE_NOTICE_GAP_MS) return;
   lastLineNoticeAt = Date.now();
   const m = (err && err.message) || String(err || '');
@@ -190,7 +190,7 @@ async function lineQueueNotice(userId, err) {
     const res = await lineApi('/reply', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ userId, text: '【小姚】' + why }),
+      body: JSON.stringify({ target, fallbackUserId, text: '【小姚】' + why }),
     });
     lineLog(`已推送排队回执（HTTP ${res.status}）`);
   } catch (_) { /* 回执失败不碍主流程 */ }
@@ -213,6 +213,18 @@ async function lineTick() {
   for (const it of items) {
     let userText = String(it.text || '').trim();
 
+    // 【2026-10-13】来源判定：群组消息不再当私聊处理。
+    //   target = 回覆目标（群 → 群 id）；convId = 该会话在 WorkBuddy 里的独立会话键，
+    //   让群里的话题与私聊互不干扰。replyToken 走 LINE 免费回覆，不占每月 200 则推播额度。
+    const srcType = String(it.srcType || 'user');
+    const isGroup = srcType === 'group' || srcType === 'room';
+    const target = isGroup ? (String(it.srcId || '') || String(it.userId)) : String(it.userId);
+    const tag = isGroup ? (srcType === 'group' ? '[LINE群] ' : '[LINE房] ') : '';
+    const convId = isGroup ? `line-${srcType}:` + target : 'line:' + it.userId;
+    const replyBody = (text) => JSON.stringify({
+      id: it.id, target, fallbackUserId: it.userId, replyToken: it.replyToken || '', text,
+    });
+
     // 语音消息：由 Worker 代取音频 → 本机转文字 → 走与文字完全相同的路径
     if (!userText && it.kind === 'audio' && it.messageId) {
       lineLog(`收到语音 ${it.userId}，正在转文字…`);
@@ -222,10 +234,7 @@ async function lineTick() {
           await lineApi('/reply', {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({
-              id: it.id, userId: it.userId,
-              text: '（这条语音我没听清，请再发一次，或者直接打字。）',
-            }),
+            body: replyBody('（这条语音我没听清，请再发一次，或者直接打字。）'),
           });
         } catch (_) {}
         continue;
@@ -239,21 +248,18 @@ async function lineTick() {
         await lineApi('/reply', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            id: it.id, userId: it.userId,
-            text: '（这条我看不到内容，请用文字或语音。）',
-          }),
+          body: replyBody('（这条我看不到内容，请用文字或语音。）'),
         });
       } catch (_) {}
       continue;
     }
 
-    log(`[LINE] 收到 ${it.userId}: ${userText.slice(0, 80)}`);
+    log(`${tag}[LINE] 收到 ${it.userId}→${target}: ${userText.slice(0, 80)}`);
     enterBusy();
     let reply = '';
     let giveUp = false;
     try {
-      reply = await deliver('line:' + it.userId, it.userId, userText);
+      reply = await deliver(convId, it.userId, userText);
     } catch (e) {
       if (e && e.delivered) {
         // 已投进 WorkBuddy，绝不重投（会重复）
@@ -264,7 +270,7 @@ async function lineTick() {
       } else {
         // 没投进去：不 ack，留在队列里下一轮再试（Worker 侧也会把 stale 的退回队列）
         lineLog(`处理受阻，留在队列稍后重试: ${((e && e.message) || e).slice(0, 80)}`);
-        await lineQueueNotice(it.userId, e);   // 至少让他知道「收到了，在排队」，而不是零反应
+        await lineQueueNotice(target, e, it.userId);   // 至少让他知道「收到了，在排队」，而不是零反应
         giveUp = true;
       }
     } finally {
@@ -277,10 +283,10 @@ async function lineTick() {
       const res = await lineApi('/reply', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ id: it.id, userId: it.userId, text: reply }),
+        body: replyBody(reply),
       });
       const d = await res.json().catch(() => ({}));
-      if (d && d.ok) log(`[LINE] 已回复 ${it.userId}: ${reply.slice(0, 60)}`);
+      if (d && d.ok) log(`${tag}[LINE] 已回复 ${target}（${d.viaReplyToken ? '免费回覆' : '推播'}）: ${reply.slice(0, 60)}`);
       else lineLog(`回推未成功: ${JSON.stringify(d).slice(0, 120)}`);
     } catch (e) {
       lineLog('回推异常: ' + ((e && e.message) || e));

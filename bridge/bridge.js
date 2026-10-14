@@ -176,6 +176,85 @@ async function asrFromLine(messageId) {
   }
 }
 
+// ---------- 圖片 / 檔案落地（2026-10-14 新增）----------
+// 多模態：LINE / Telegram 傳來的圖片或檔案，先落到本機，再把路徑丟給 Agent 讀
+// （Agent 用 Read 工具就能看圖、看 PDF）。設計原則同語音：這條線整體 try/catch，
+// 壞了只回一句提示，絕不帶崩通道。
+const MEDIA_DIR = '/Users/macmini/WorkBuddy/Claw/media';
+const MEDIA_KEEP_MS = 7 * 24 * 3600 * 1000;   // 媒體保留 7 天，之後自動清掉
+try { fs.mkdirSync(MEDIA_DIR, { recursive: true }); } catch (_) {}
+
+const EXT_BY_MIME = {
+  'image/jpeg': '.jpg', 'image/jpg': '.jpg', 'image/png': '.png',
+  'image/gif': '.gif', 'image/webp': '.webp', 'image/heic': '.heic',
+  'application/pdf': '.pdf',
+};
+
+function saveMedia(buf, ext, prefix) {
+  const name = `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}${ext}`;
+  const p = path.join(MEDIA_DIR, name);
+  fs.writeFileSync(p, buf);
+  return p;
+}
+
+function pruneMedia() {
+  try {
+    const now = Date.now();
+    for (const f of fs.readdirSync(MEDIA_DIR)) {
+      const p = path.join(MEDIA_DIR, f);
+      try { if (now - fs.statSync(p).mtimeMs > MEDIA_KEEP_MS) fs.unlinkSync(p); } catch (_) {}
+    }
+  } catch (_) {}
+}
+pruneMedia();
+
+// LINE 圖片/檔案：本机没有 Channel Token，由 Worker 代取（/content?id=…）
+async function mediaFromLine(messageId, prefix) {
+  try {
+    const res = await lineApi('/content?id=' + encodeURIComponent(messageId), { timeout: 60000 });
+    if (!res.ok) { lineLog(`取媒體失敗 HTTP ${res.status}`); return null; }
+    const ct = String(res.headers.get('content-type') || '').split(';')[0].trim();
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (!buf.length) { lineLog('取到空媒體'); return null; }
+    const ext = EXT_BY_MIME[ct] || '.bin';
+    return { path: saveMedia(buf, ext, prefix), bytes: buf.length, mime: ct || 'unknown' };
+  } catch (e) {
+    lineLog('取媒體異常: ' + ((e && e.message) || e));
+    return null;
+  }
+}
+
+// Telegram 圖片/檔案：getFile → 下載 → 落地
+async function mediaFromTelegram(fileId, prefix, fallbackExt) {
+  try {
+    const r = await fetch(`${TG}/getFile?file_id=${encodeURIComponent(fileId)}`, { signal: AbortSignal.timeout(20000) });
+    const j = await r.json().catch(() => ({}));
+    if (!j || !j.ok || !j.result || !j.result.file_path) {
+      log('[MEDIA] Telegram getFile 失败: ' + JSON.stringify(j).slice(0, 140));
+      return null;
+    }
+    const fr = await fetch(`https://api.telegram.org/file/bot${BOT}/${j.result.file_path}`, { signal: AbortSignal.timeout(60000) });
+    if (!fr.ok) { log(`[MEDIA] 下載失敗 HTTP ${fr.status}`); return null; }
+    const buf = Buffer.from(await fr.arrayBuffer());
+    if (!buf.length) { log('[MEDIA] 下載到空檔案'); return null; }
+    const m = /\.([a-z0-9]+)$/i.exec(j.result.file_path);
+    const ext = m ? '.' + m[1].toLowerCase() : (fallbackExt || '.jpg');
+    return { path: saveMedia(buf, ext, prefix), bytes: buf.length, mime: 'unknown' };
+  } catch (e) {
+    log('[MEDIA] 取媒體異常: ' + ((e && e.message) || e));
+    return null;
+  }
+}
+
+// 交给 Agent 的指令：Agent 用 Read 工具讀這個路徑就能看圖 / 看檔
+function mediaInstruction(kind, p, bytes) {
+  return (
+    `【${kind === 'image' ? '圖片' : '檔案'}】使用者傳來${kind === 'image' ? '一張圖片' : '一個檔案'}，` +
+    `已存到本機：${p}（${Math.max(1, Math.round(bytes / 1024))} KB）\n` +
+    '請用 Read 工具讀取這個檔案（支援看圖／看 PDF），再根據內容回答使用者。'
+  );
+}
+
 // 【2026-10-12 补】投递受阻时不能让 Jack 干等 —— 他只会得出「LINE 又挂了」的结论。
 // 这就是 17:17~17:20 他连发三条「情況說明」的原因：本机在忙、投递 fetch failed 却零回执，
 // 他看不到任何反应，只能一直重发。与 tele 侧排队回执（QUEUE_NOTICE_GAP_MS）同构：
@@ -244,6 +323,25 @@ async function lineTick() {
         continue;
       }
       lineLog(`语音转写: ${userText.slice(0, 60)}`);
+    }
+
+    // 【2026-10-14】圖片 / 檔案：由 Worker 代取內容 → 落地本機 → 把路徑交給 Agent 讀
+    if (!userText && (it.kind === 'image' || it.kind === 'file') && it.messageId) {
+      const label = it.kind === 'image' ? '圖片' : '檔案';
+      lineLog(`收到${label} ${it.userId}，正在取回…`);
+      const m = await mediaFromLine(it.messageId, it.kind === 'image' ? 'line-img' : 'line-file');
+      if (!m) {
+        try {
+          await lineApi('/reply', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: replyBody(`（這${label}我沒取到，麻煩再傳一次。）`),
+          });
+        } catch (_) {}
+        continue;
+      }
+      userText = mediaInstruction(it.kind, m.path, m.bytes);
+      lineLog(`${label}已存檔: ${m.path} (${Math.round(m.bytes / 1024)} KB)`);
     }
 
     if (!userText) {
@@ -1036,8 +1134,36 @@ async function handleMessage(msg, cloudId) {
     log(`语音转写: ${text.slice(0, 80)}`);
   }
 
+  // 【2026-10-14】圖片 / 檔案：下載落地，交給 Agent 讀（多模態）
   if (!text) {
-    await tgSend(chatId, '（目前只处理文字和语音讯息。）');
+    let media = null;
+    let kind = '';
+    if (Array.isArray(msg.photo) && msg.photo.length) {
+      media = msg.photo[msg.photo.length - 1];   // photo 是多种尺寸，取最大那张
+      kind = 'image';
+    } else if (msg.document) {
+      media = msg.document;
+      kind = String(msg.document.mime_type || '').startsWith('image/') ? 'image' : 'file';
+    }
+    if (media && media.file_id) {
+      const label = kind === 'image' ? '圖片' : '檔案';
+      await tgSend(chatId, `收到${label}，正在處理…`);
+      const m = await mediaFromTelegram(
+        media.file_id,
+        kind === 'image' ? 'tg-img' : 'tg-file',
+        kind === 'image' ? '.jpg' : '.bin'
+      );
+      if (!m) {
+        await tgSend(chatId, `這${label}我沒取到，麻煩再傳一次。`);
+        return true;
+      }
+      text = mediaInstruction(kind, m.path, m.bytes);
+      log(`${label}已存檔: ${m.path} (${Math.round(m.bytes / 1024)} KB)`);
+    }
+  }
+
+  if (!text) {
+    await tgSend(chatId, '（目前只处理文字、语音、图片和档案讯息。）');
     return true;
   }
   log(`收到 ${chatId}: ${text.slice(0, 80)}`);

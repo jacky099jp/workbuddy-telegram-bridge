@@ -36,6 +36,9 @@ const SECRET_FILE = path.join(DIR, 'secret');
 const GW_HINT_FILE = path.join(DIR, 'gwport');
 const STATE_FILE = path.join(DIR, 'state.json');
 const PENDING_FILE = path.join(DIR, 'pending.json');
+// 【2026-10-15】LINE 回覆「掛起」檔：回得太慢、reply token 過期時，把回覆存這裡，
+// 等他下次叫我（有新的免費 reply token）再一起送，不為了快而白扣推播額度。
+const LINE_HELD_FILE = path.join(DIR, 'line_held.json');
 const LOG_FILE = path.join(DIR, 'bridge.log');
 const STOP_FILE = path.join(DIR, 'STOP');
 const HEARTBEAT_FILE = path.join(DIR, 'heartbeat');
@@ -279,6 +282,39 @@ async function lineQueueNotice(target, err, fallbackUserId) {
   } catch (_) { /* 回执失败不碍主流程 */ }
 }
 
+// 【2026-10-15】Jack 規則：「LINE 如果來不及回應，可以等下次有叫你時一起回應。」
+// 回得太慢 → reply token（約 1 分鐘）已過期 → 老做法會退回 push（群組一次扣 5 則）。
+// 新做法：不 push，把這條回覆「掛」在 line_held.json，等他下次叫我時（有新的免費 token）合併送出。
+const LINE_HELD_TTL_MS = 6 * 60 * 60 * 1000;   // 掛超過 6 小時就作廢，免得回一句過時的話
+function readHeld() {
+  try {
+    const o = JSON.parse(fs.readFileSync(LINE_HELD_FILE, 'utf8'));
+    return o && typeof o === 'object' && !Array.isArray(o) ? o : {};
+  } catch (_) { return {}; }
+}
+function writeHeld(o) {
+  try { fs.writeFileSync(LINE_HELD_FILE, JSON.stringify(o, null, 2)); } catch (_) {}
+}
+function peekHeld(target) {
+  const o = readHeld();
+  const e = o[target];
+  if (!e) return '';
+  if (Date.now() - Number(e.at || 0) > LINE_HELD_TTL_MS) { delete o[target]; writeHeld(o); return ''; }
+  return String(e.text || '');
+}
+function clearHeld(target) {
+  const o = readHeld();
+  if (o[target]) { delete o[target]; writeHeld(o); }
+}
+function addHeld(target, text) {
+  const o = readHeld();
+  const prev = o[target] && o[target].text ? String(o[target].text) + '\n\n' : '';
+  let merged = prev + String(text || '');
+  if (merged.length > 3000) merged = merged.slice(-3000);   // 別無限長大
+  o[target] = { text: merged, at: Date.now() };
+  writeHeld(o);
+}
+
 // 取一次 LINE 来信并逐条处理完（串行，与 tele 共用一个 Agent）
 async function lineTick() {
   if (!LINE_URL || !LINE_KEY) return;
@@ -424,17 +460,34 @@ async function lineTick() {
       } catch (_) {}
       continue;
     }
+    // 【2026-10-15】先把上次「掛著」沒送出去的回覆接回來，跟這次合併成一次送。
+    const held = peekHeld(target);
+    if (held) reply = held + '\n\n' + reply;
+
     try {
       const res = await lineApi('/reply', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: replyBody(reply),
+        body: JSON.stringify({
+          id: it.id, target, fallbackUserId: it.userId,
+          replyToken: it.replyToken || '', text: reply,
+          hold: true,   // 回得太慢（token 過期）就不要 push，掛著等下次一起回
+        }),
       });
       const d = await res.json().catch(() => ({}));
-      if (d && d.ok) log(`${tag}[LINE] 已回复 ${target}（${d.viaReplyToken ? '免费回覆' : '推播'}）: ${reply.slice(0, 60)}`);
-      else lineLog(`回推未成功: ${JSON.stringify(d).slice(0, 120)}`);
+      if (d && d.ok) {
+        if (held) clearHeld(target);
+        log(`${tag}[LINE] 已回复 ${target}（${d.viaReplyToken ? '免费回覆' : '推播'}）: ${reply.slice(0, 60)}`);
+      } else if (d && d.held) {
+        addHeld(target, reply);
+        log(`${tag}[LINE] 回得慢（token 已過期），先掛著，等你下次叫我一起回：${reply.slice(0, 50)}`);
+      } else {
+        addHeld(target, reply);
+        lineLog(`回推未成功（已掛著下一輪再送）: ${JSON.stringify(d).slice(0, 120)}`);
+      }
     } catch (e) {
-      lineLog('回推异常: ' + ((e && e.message) || e));
+      addHeld(target, reply);
+      lineLog('回推异常（已掛著下一輪再送）: ' + ((e && e.message) || e));
     }
   }
 }

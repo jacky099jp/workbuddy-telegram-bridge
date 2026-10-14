@@ -263,6 +263,15 @@ function mediaInstruction(kind, p, bytes) {
 // 他看不到任何反应，只能一直重发。与 tele 侧排队回执（QUEUE_NOTICE_GAP_MS）同构：
 // 3 分钟最多一条；走 Worker /reply 直推（不经过本机网关，所以本机忙时也发得出去）。
 // 注意：**不带 item id**，即不 ack —— 消息必须留在队列里等下一轮真的处理。
+// 【2026-10-15】Jack 指示：「卡著可以通知 tele」。LINE 一旦卡住（本機忙 / 回得慢），
+// 一律改用 tele 通知他 —— tele 是直連 Bot API，不佔 LINE 每月推播額度。
+async function tgNotifyJack(text) {
+  for (const chatId of ALLOW) {
+    try { await tgSend(chatId, text); }
+    catch (e) { lineLog('tele 通知失敗: ' + ((e && e.message) || e)); }
+  }
+}
+
 let lastLineNoticeAt = 0;
 const LINE_NOTICE_GAP_MS = 3 * 60 * 1000;
 async function lineQueueNotice(target, err, fallbackUserId) {
@@ -272,20 +281,16 @@ async function lineQueueNotice(target, err, fallbackUserId) {
   const why = m === 'RATE_LIMITED'
     ? '我現在在電腦上忙（這台機器同一時間只跑一件事），空出來就處理你這條，不用重發。'
     : '本機通道剛好在重啟或抖動，你這條我先收著了，稍後會自動補處理，不用重發。';
-  try {
-    const res = await lineApi('/reply', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ target, fallbackUserId, text: '【小姚】' + why }),
-    });
-    lineLog(`已推送排队回执（HTTP ${res.status}）`);
-  } catch (_) { /* 回执失败不碍主流程 */ }
+  // 走 tele 通知，不佔 LINE 推播額度（群組一次就 5 則）
+  await tgNotifyJack('【LINE 卡住了】' + why);
+  lineLog('已發 tele 排隊回執（不佔 LINE 額度）');
 }
 
 // 【2026-10-15】Jack 規則：「LINE 如果來不及回應，可以等下次有叫你時一起回應。」
 // 回得太慢 → reply token（約 1 分鐘）已過期 → 老做法會退回 push（群組一次扣 5 則）。
 // 新做法：不 push，把這條回覆「掛」在 line_held.json，等他下次叫我時（有新的免費 token）合併送出。
 const LINE_HELD_TTL_MS = 6 * 60 * 60 * 1000;   // 掛超過 6 小時就作廢，免得回一句過時的話
+let lastHeldNotifyAt = 0;                       // tele 通知別洗版（2 分鐘最多一條）
 function readHeld() {
   try {
     const o = JSON.parse(fs.readFileSync(LINE_HELD_FILE, 'utf8'));
@@ -481,6 +486,13 @@ async function lineTick() {
       } else if (d && d.held) {
         addHeld(target, reply);
         log(`${tag}[LINE] 回得慢（token 已過期），先掛著，等你下次叫我一起回：${reply.slice(0, 50)}`);
+        // 【2026-10-15】Jack 指示：卡著就通知 tele，內容一併帶上，免得他以為沒回應。
+        if (Date.now() - lastHeldNotifyAt > 2 * 60 * 1000) {
+          lastHeldNotifyAt = Date.now();
+          await tgNotifyJack(
+            '【LINE 回得慢，先掛著】你下次在 LINE 叫我時，我會連這條一起回。\n內容：' + reply.slice(0, 300)
+          );
+        }
       } else {
         addHeld(target, reply);
         lineLog(`回推未成功（已掛著下一輪再送）: ${JSON.stringify(d).slice(0, 120)}`);

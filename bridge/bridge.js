@@ -28,6 +28,23 @@ const path = require('path');
 const ARCHIVE_PAUSE = '/Users/macmini/WorkBuddy/Claw/records/.pause-group-archive';
 // 成員名冊：userId → 名字（JSON）。有了它，記錄檔就不必只寫一串 id。
 const NAME_BOOK = '/Users/macmini/WorkBuddy/Claw/records/成員名冊.json';
+const JACK_LINE_ID = 'Uaa393cb8ded525c0c2c0d395393f1aa6';
+// 群訊息「未點名小姚」的留存檔（見 lineTick 的硬閘門說明）。
+const GROUP_UNNAMED_DIR = '/Users/macmini/WorkBuddy/Claw/records';
+// 【2026-10-16】群訊息是否「點名小姚」。硬閘門與投遞標註共用，避免兩處規則不一致。
+function isCallingXiaoyao(text) {
+  return /小姚|小瑶|小遙/.test(String(text || ''));
+}
+// 把 userId 換成人名，查不到就退回 id 前 12 碼。
+function groupWho(userId) {
+  let who = '成員 ' + String(userId).slice(0, 12) + '…';
+  try {
+    const book = JSON.parse(fs.readFileSync(NAME_BOOK, 'utf8'));
+    if (book && book[userId]) who = String(book[userId]);
+  } catch (_) {}
+  if (userId === JACK_LINE_ID) who = 'Jack';
+  return who;
+}
 const { execFileSync } = require('child_process');
 
 const DIR = __dirname;
@@ -451,11 +468,60 @@ async function lineTick() {
         lineLog('群訊息歸檔失敗: ' + ((e && e.message) || e));
       }
     }
+    // 【2026-10-16】群訊息硬閘門：沒點名「小姚」的群訊息，本機直接吞掉，不投給 Agent。
+    //
+    // 事故背景（這條規則為什麼要寫在程式碼裡，而不是交給 Agent 判斷）：
+    //   16:48 Jack 在家族群對家人說話「妍妍.需要幫你帶便當嗎」，那是講給人聽的、不是給我的。
+    //   但「群裡只有被叫小姚才回應」這條政策當時只活在 Agent 的對話上下文裡，
+    //   而那個上下文在當天 13:49~16:31 之間被壓縮（compaction）過 → 規則掉了 →
+    //   Agent 以為是普通提問、正常作答 → 那段回覆直接被送進 Jack 的家族群。
+    //   教訓：政策放在「會被壓縮／會被遺忘」的地方＝一定會漏。
+    //   所以判斷改到這層：Agent 根本看不到未點名的群訊息，自然不可能回錯話。
+    //
+    // 為什麼仍要回一次 [靜默]：Worker 佇列要靠 /reply 才會 ack 把訊息移出佇列，
+    //   Worker 端對 [靜默] 是同款處理（吞掉不發送、不耗額度、照樣 ack）。
+    if (isGroup && !isCallingXiaoyao(userText)) {
+      log(`${tag}[LINE] 未點名小姚 → 不投 Agent（只留存）：${groupWho(it.userId)}：${userText.slice(0, 40)}`);
+      try {
+        const d2 = new Date();
+        const p2b = (n) => String(n).padStart(2, '0');
+        const ym2 = `${d2.getFullYear()}-${p2b(d2.getMonth() + 1)}`;
+        const f2 = path.join(GROUP_UNNAMED_DIR, `群訊息-未點名-${ym2}.md`);
+        if (!fs.existsSync(f2)) {
+          fs.mkdirSync(path.dirname(f2), { recursive: true });
+          fs.writeFileSync(f2, `# LINE 群訊息（未點名小姚 · 僅留存不回應）· ${ym2}\n\n`);
+        }
+        const stamp2 =
+          `${p2b(d2.getMonth() + 1)}-${p2b(d2.getDate())} ` +
+          `${p2b(d2.getHours())}:${p2b(d2.getMinutes())}`;
+        fs.appendFileSync(
+          f2,
+          `- ${stamp2} ${groupWho(it.userId)}：${userText.replace(/\s*\n\s*/g, ' ')}\n`
+        );
+      } catch (e) {
+        lineLog('群訊息留存失敗: ' + ((e && e.message) || e));
+      }
+      try {
+        await lineApi('/reply', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: replyBody('[靜默]'),
+        });
+      } catch (_) {}
+      continue;
+    }
+
     enterBusy();
     let reply = '';
     let giveUp = false;
+    // 【2026-10-16】群訊息投遞時自帶規則橫幅：就算 Agent 的上下文被壓縮，
+    // 「這是群聊、沒被點名只能回 [靜默]」也不至於消失。
+    const deliverText = isGroup
+      ? `[LINE 群組訊息｜寄件者 ${groupWho(it.userId)}（${it.userId}）｜` +
+        `規則：群裡只有被叫「小姚」才可回應；未被點名就只回 [靜默]，不要插話]\n${userText}`
+      : userText;
     try {
-      reply = await deliver(convId, it.userId, userText);
+      reply = await deliver(convId, it.userId, deliverText);
     } catch (e) {
       if (e && e.delivered) {
         // 已投进 WorkBuddy，绝不重投（会重复）

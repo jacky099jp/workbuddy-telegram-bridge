@@ -329,8 +329,17 @@ function clearHeld(target) {
 }
 function addHeld(target, text) {
   const o = readHeld();
-  const prev = o[target] && o[target].text ? String(o[target].text) + '\n\n' : '';
-  let merged = prev + String(text || '');
+  const parts = o[target] && o[target].text ? String(o[target].text).split('\n\n') : [];
+  // 【2026-10-16】去重：網關不通時同一條訊息會被反覆重試，每次產生一模一樣的回覆；
+  // 舊寫法直接串接，holding 會堆成十幾遍相同的話，下次一起送出時非常難看。
+  const seen = new Set(parts.map(s => s.trim()));
+  for (const s of String(text || '').split('\n\n')) {
+    const k = s.trim();
+    if (!k || seen.has(k)) continue;
+    seen.add(k);
+    parts.push(s);
+  }
+  let merged = parts.join('\n\n');
   if (merged.length > 3000) merged = merged.slice(-3000);   // 別無限長大
   o[target] = { text: merged, at: Date.now() };
   writeHeld(o);

@@ -193,8 +193,11 @@ const EXT_BY_MIME = {
   'application/pdf': '.pdf',
 };
 
-function saveMedia(buf, ext, prefix) {
-  const name = `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}${ext}`;
+function saveMedia(buf, ext, prefix, cacheKey) {
+  // 【2026-10-16】带 cacheKey（LINE messageId）时，档名固定含 messageId，
+  // 供 mediaFromLine 重试时免重抓（今天早上同两张图被重抓 117 次、约 95MB）。
+  const key = cacheKey ? String(cacheKey).replace(/[^A-Za-z0-9_-]/g, '') : String(Date.now());
+  const name = `${prefix}-${key}-${Math.random().toString(36).slice(2, 7)}${ext}`;
   const p = path.join(MEDIA_DIR, name);
   fs.writeFileSync(p, buf);
   return p;
@@ -213,6 +216,19 @@ pruneMedia();
 
 // LINE 圖片/檔案：本机没有 Channel Token，由 Worker 代取（/content?id=…）
 async function mediaFromLine(messageId, prefix) {
+  // 【2026-10-16】重試去重：同一則訊息（messageId 相同）卡隊列重試時，
+  // 直接重用已下載的檔案，不再重複抓（2026-10-16 上午同兩張圖被重抓 117 次）。
+  try {
+    const safe = String(messageId).replace(/[^A-Za-z0-9_-]/g, '');
+    if (safe) {
+      const hit = fs.readdirSync(MEDIA_DIR).find((f) => f.startsWith(`${prefix}-${safe}-`));
+      if (hit) {
+        const p = path.join(MEDIA_DIR, hit);
+        lineLog(`媒體快取命中，免重抓: ${hit}`);
+        return { path: p, bytes: fs.statSync(p).size, mime: 'cached' };
+      }
+    }
+  } catch (_) {}
   try {
     const res = await lineApi('/content?id=' + encodeURIComponent(messageId), { timeout: 60000 });
     if (!res.ok) { lineLog(`取媒體失敗 HTTP ${res.status}`); return null; }
@@ -220,7 +236,7 @@ async function mediaFromLine(messageId, prefix) {
     const buf = Buffer.from(await res.arrayBuffer());
     if (!buf.length) { lineLog('取到空媒體'); return null; }
     const ext = EXT_BY_MIME[ct] || '.bin';
-    return { path: saveMedia(buf, ext, prefix), bytes: buf.length, mime: ct || 'unknown' };
+    return { path: saveMedia(buf, ext, prefix, messageId), bytes: buf.length, mime: ct || 'unknown' };
   } catch (e) {
     lineLog('取媒體異常: ' + ((e && e.message) || e));
     return null;

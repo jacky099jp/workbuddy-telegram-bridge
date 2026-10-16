@@ -443,14 +443,30 @@ def cmd_refresh(bridge):
     C.remember_bridge_dir(bridge)
     # 【铁律】健康就绝不重启桥接——每次重启都会打断在途消息并制造空窗。
     # 桥接已自带三层自愈（端口 5 秒重定位、密钥自动收割、WorkBuddy 死亡自动拉起），
-    # 例行维护只应「查」，只有确认不健康才允许动。
+    # 例行维护只应「查」，只有确认自己有病才允许动。
     healthy, detail = check_gateway(bridge)
     if healthy:
         print("网关健康（%s），桥接不重启（避免打断在途消息）。" % detail)
         return 0
-    if pgrep_bridge():
+
+    # 【2026-10-16 关键修正】「网关不通」≠「桥接有问题」。
+    # 实测（2026-10-16 10:36→12:20）：WorkBuddy 换会话时它的网关进程会整段消失，
+    # 端口空白期可长达 20 分钟以上。这段时间踢桥接毫无帮助 —— 桥接本身活着、
+    # 自带 5 秒端口重定位，网关一回来它自己就接上；而每次 kickstart 反而制造一次
+    # 「盲窗」，把重启瞬间的在途消息打断，且 bridge.log 会刷出每 5 分钟一条
+    # 「桥接启动」（本次事故就是它造成的）。
+    # 现在：只有桥接自身确实不健康（进程不在 / 心跳停摆）才允许重启。
+    hb_state, idle_age, busy_age = check_heartbeat(bridge)
+    if not pgrep_bridge():
         launchctl("kickstart", "-k", "gui/%d/%s" % (os.getuid(), LABEL_BRIDGE))
-        print("网关不健康（%s），已重启桥接。" % detail)
+        print("桥接进程不在 → 已拉起。")
+    elif hb_state == "stale":
+        launchctl("kickstart", "-k", "gui/%d/%s" % (os.getuid(), LABEL_BRIDGE))
+        print("桥接心跳停摆（%.0f 秒无动静）→ 已重启。" % (idle_age or 0))
+    else:
+        pfx = "处理中" if hb_state == "busy" else ("%.0f 秒前" % (idle_age or 0))
+        print("网关暂时不通但桥接健康（心跳 %s）→ 不重启，交由桥接自行重定位（5 秒一轮）。" % pfx)
+
     healthy, detail = check_gateway(bridge)
     print("刷新后网关：%s（%s）" % ("健康" if healthy else "仍不通", detail))
     return 0 if healthy else 1

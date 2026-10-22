@@ -74,6 +74,84 @@ const TG = `https://api.telegram.org/bot${BOT}`;
 const ALLOW = new Set((CONFIG.allow_chats || []).map(String));
 const REPLY_TIMEOUT = CONFIG.reply_timeout_ms || 600000;
 
+// ---------- 僵尸 run 治理（2026-10-21）----------
+// Jack 当天的原话：「問題你沒在忙～」。他说得对。
+// 真相：不是我在忙，是 03:15 那个回合卡了 15 分钟超时后，服务端 run 一直挂着；
+// 桥接的看门狗只杀自己的进程，从不取消服务端的 run。僵尸越积越多，
+// 网关认为「还有回合在跑」，此后每条新消息一律 429 —— 从 04:31 一直堵到 15:51 重启。
+// 对策：① 记住「当前活着的 run」；② 取不到回复就把它取消，别留悬；
+//       ③ 桥接重启时，先把上次遗留的 run 取消掉，绝不让它跨进程堆积。
+const RUN_STATE_FILE = path.join(DIR, 'run_state.json');
+const liveRuns = new Set();
+
+function markRun(runId) {
+  liveRuns.add(runId);
+  try { fs.writeFileSync(RUN_STATE_FILE, JSON.stringify({ runId, at: Date.now() })); } catch (_) {}
+}
+function clearRun(runId) {
+  if (runId) liveRuns.delete(runId);
+  try { fs.unlinkSync(RUN_STATE_FILE); } catch (_) {}
+}
+async function cancelRun(runId) {
+  if (!runId) return false;
+  try {
+    const secret = readSecret();
+    if (!secret) return false;
+    const res = await fetch(`${GW}/api/v1/runs/${runId}/cancel`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-access-token': secret,
+        'x-codebuddy-request': '1',
+      },
+      body: '{}',
+      signal: AbortSignal.timeout(8000),
+    });
+    log(`取消悬着的 run ${String(runId).slice(0, 8)} → HTTP ${res.status}`);
+    return res.ok;
+  } catch (e) {
+    log(`取消 run 失败: ${(e && e.message) || e}`);
+    return false;
+  }
+}
+// 网关报 429 时：先确认是不是上次悬着的 run 在挡路，是就清掉
+async function clearStaleOn429() {
+  let st = null;
+  try { st = JSON.parse(fs.readFileSync(RUN_STATE_FILE, 'utf8')); } catch (_) {}
+  if (!st || !st.runId) return false;
+  log(`网关 429：先清掉上次悬着的 run ${String(st.runId).slice(0, 8)}，再重试`);
+  const ok = await cancelRun(st.runId);
+  clearRun(st.runId);
+  return ok;
+}
+
+// 启动时扫一次：上次进程留下的 run 若还 active，就取消它
+async function sweepOrphanRun() {
+  let st = null;
+  try { st = JSON.parse(fs.readFileSync(RUN_STATE_FILE, 'utf8')); } catch (_) {}
+  if (!st || !st.runId) return;
+  const age = Date.now() - (st.at || 0);
+  if (age < 60000) return;                    // 刚写下，可能本进程正在用
+  try {
+    const secret = readSecret();
+    const r = await fetch(`${GW}/api/v1/runs/${st.runId}`, {
+      headers: { 'x-access-token': secret, 'x-codebuddy-request': '1' },
+      signal: AbortSignal.timeout(6000),
+    });
+    const j = await r.json().catch(() => ({}));
+    const active = !!(j && j.data && j.data.active);
+    if (active) {
+      log(`发现上次遗留的 run（已悬 ${Math.round(age / 1000)} 秒），正在取消，避免网关继续 429`);
+      await cancelRun(st.runId);
+    } else {
+      log('上次遗留的 run 已自行结束，清除记录');
+    }
+  } catch (e) {
+    log('检查遗留 run 失败（不影响主流程）: ' + ((e && e.message) || e));
+  }
+  try { fs.unlinkSync(RUN_STATE_FILE); } catch (_) {}
+}
+
 // ---------- 云端模式（2026-10-11 新增）----------
 // 云端小姚持有 Telegram 的 webhook，本机改成「向云端领消息 / 把回复交给云端发」。
 // 目的：本机重启换端口、密钥过期都不再影响收信；本机不在线时云端自己顶上。
@@ -673,7 +751,7 @@ const RATE_LIMIT_BACKOFF_MS = 60 * 1000;
 // WorkBuddy 常常只是「正忙一下」，几秒后就有空档 —— 能接就本机答（能力全、答案好），
 // 实在接不了才放手让云端兜底。总等待必须明显短于云端的兜底时限（60 秒），
 // 否则云端兜底先触发，这条又被本机答一次，Jack 会收到两份回答。
-const CLOUD_HANDOFF_RETRIES = 2;
+const CLOUD_HANDOFF_RETRIES = 3;
 const CLOUD_HANDOFF_GAP_MS = 15 * 1000;
 // 网关端口会随 WorkBuddy 开新窗口/重启而变化 —— 每 5 秒自检 + 每次投递前确认，
 // 让「端口漂移」对使用者完全无感（等同固定端口）
@@ -972,7 +1050,13 @@ async function notifyRecoverIfDue() {
 let cloudPingTimer = null;
 function startCloudPing() {
   if (cloudPingTimer || !CLOUD_URL) return;
-  cloudPingTimer = setInterval(() => {
+  cloudPingTimer = setInterval(async () => {
+    // 【2026-10-21】网关不通（WorkBuddy 重启/端口漂移）时不要再报「在线」：
+    // 报在线 + 不取信 = 云端以为本机在答、本机又没取，消息两头落空（Jack 遇到过 4 分钟全沉默）。
+    // 停报 60 秒后云端会判定本机离线，自动接管回答；恢复后下一次 ping 立刻回在线。
+    try {
+      if (!(await probeHealth(GW))) return;
+    } catch (_) { return; }
     fetch(`${CLOUD_URL}/ping`, { headers: cloudHeaders(), signal: AbortSignal.timeout(8000) })
       .catch(() => { /* 报到失败不碍事，主流程照跑 */ });
   }, 25000);
@@ -1122,7 +1206,7 @@ async function tgSend(chatId, text) {
 
 // ---------- WorkBuddy 网关 ----------
 
-async function startRun(chatId, userId, text) {
+async function startRun(chatId, userId, text, convSuffix) {
   const secret = readSecret();
   if (!secret) throw new Error('NO_SECRET');
   const payload = {
@@ -1131,7 +1215,9 @@ async function startRun(chatId, userId, text) {
     source: {
       platform: 'generic',
       sender: { id: String(userId) },
-      conversation: { id: String(chatId), type: 'direct' },
+      // 【2026-10-22】网关按「会话」限并发（同一 conversation 同时只跑一个 run）。
+      // 正常走 chatId 保持上下文连续；429 逃生时带 convSuffix 换一条通道，实测可并行 202。
+      conversation: { id: String(chatId) + (convSuffix ? `-${convSuffix}` : ''), type: 'direct' },
     },
     payload: { text },
     timeoutMs: REPLY_TIMEOUT,
@@ -1150,7 +1236,9 @@ async function startRun(chatId, userId, text) {
   if (res.status === 401) throw new Error('BAD_SECRET');
   if (res.status === 429) throw new Error('RATE_LIMITED');
   if (!res.ok) throw new Error(`网关返回 ${res.status}: ${JSON.stringify(data).slice(0, 200)}`);
-  return data.data.runId;
+  const runId = data.data.runId;
+  markRun(runId);
+  return runId;
 }
 
 /**
@@ -1244,7 +1332,7 @@ async function awaitReply(runId) {
 }
 
 // 投递一条讯息并取回回复（网关不可用时抛错）
-async function deliver(chatId, userId, text) {
+async function deliver(chatId, userId, text, convSuffix) {
   // 投递前先确认端口：WorkBuddy 一开新窗口就换端口，此刻必须是最新的
   if (!(await probeHealth(GW))) {
     const found = await resolveGateway();
@@ -1254,13 +1342,20 @@ async function deliver(chatId, userId, text) {
       log('投递前重定位网关 -> ' + GW);
     }
   }
-  const runId = await withGateway(() => startRun(chatId, userId, text));
+  const runId = await withGateway(() => startRun(chatId, userId, text, convSuffix));
   // 关键：startRun 成功 = 讯息已真正进入 WorkBuddy（run 已创建）。
   // 此后若取回复失败，绝不能重投 —— 那会在 WorkBuddy 里产生重复的同一条讯息。
   // 用 delivered 标记把它和「压根没投进去」区分开。
   try {
-    return await awaitReply(runId);
+    const text = await awaitReply(runId);
+    clearRun(runId);
+    return text;
   } catch (e) {
+    // 【2026-10-21】取不到回复 = 这个 run 悬在服务端没结束。
+    // 不取消它，下一条消息就会被网关 429（僵尸占着「排队位」）——
+    // 今天 04:31 到 15:51 那七个小时的沉默就是这么来的。
+    await cancelRun(runId);
+    clearRun(runId);
     const err = new Error('回复未取回: ' + ((e && e.message) || ''));
     err.delivered = true;
     throw err;
@@ -1349,6 +1444,44 @@ async function handleMessage(msg, cloudId) {
       if (cloudId) {
         // 先给本机几个短窗口：WorkBuddy 常常只是「正忙一下」，几秒后就有空档。
         // 能接就本机答（能力全、答案质量高）；接不了就主动交棒给云端，别让 Jack 干等。
+        // 【2026-10-21】网关 429 = 本机正在跑上一个回合（长任务常见 1-3 分钟）。
+        // 以前只等 30 秒就交棒，Jack 收到的是云端弱回答甚至没回答 → 先回一条「在忙」回执，别让他以为通道死了。
+        if (e.message === 'RATE_LIMITED') {
+          // 【2026-10-21】429 不一定是「我在忙」，更常见是上次的 run 悬着占位。
+          // 先清僵尸再投一次，通了就正常回，不要拿「在忙」去糊弄 Jack。
+          if (await clearStaleOn429()) {
+            try {
+              const r0 = await deliver(chatId, userId, text);
+              await tgSend(chatId, r0 || '（处理完成，但这次没有产出文字回复。）');
+              log(`清掉悬着的 run 后重投成功，由本机回答: ${text.slice(0, 30)}`);
+              return true;
+            } catch (e0) {
+              if (e0.delivered) {
+                await tgSend(chatId, '这条我已经收到并处理了，只是回复在回传时丢了。不用重发，结果我稍后直接推给你。');
+                return true;
+              }
+              log(`清僵尸后仍受阻（${e0.message}）: ${text.slice(0, 30)}`);
+            }
+          }
+          // 【2026-10-22 逃生】实测：网关 429 是「同一会话只许一个 run」，不是整机锁死——
+          // 换 conversation id 可以并行投进去（两探针同时 202）。
+          // 占位的长回合经常是我正在跑的活，cancel 对它无效（实测 404），只能换道走。
+          // 代价：这条走的是新会话、没有前文，回答会短一些，但远好过云端兜底或沉默。
+          try {
+            const escId = 'esc' + Math.floor(Date.now() / 1000);
+            const r1 = await deliver(chatId, userId, text, escId);
+            await tgSend(chatId, r1 || '（处理完成，但这次没有产出文字回复。）');
+            log(`换道逃生成功（${escId}），由本机回答: ${text.slice(0, 30)}`);
+            return true;
+          } catch (e1) {
+            if (e1.delivered) {
+              await tgSend(chatId, '这条我已经收到并处理了，只是回复在回传时丢了。不用重发，结果我稍后直接推给你。');
+              return true;
+            }
+            log(`换道逃生仍失败（${e1.message}）: ${text.slice(0, 30)}`);
+          }
+          try { await tgSend(chatId, '收到，我先把手上的事做完（约 1-2 分钟），这条排着，马上回你。'); } catch (_) {}
+        }
         for (let i = 1; i <= CLOUD_HANDOFF_RETRIES; i++) {
           await sleep(CLOUD_HANDOFF_GAP_MS);
           try {
@@ -1495,6 +1628,9 @@ async function main() {
   } else {
     log('警告：启动时未能定位本机网关，将在收到讯息时重试定位。');
   }
+  // 先把上一个进程遗留的 run 清掉：僵尸不清，本进程投什么都会被 429 挡回
+  if (found) await sweepOrphanRun();
+
   log('桥接启动。网关=' + GW + '，允许会话=' + [...ALLOW].join(',') +
       (pending.length ? `，待补发 ${pending.length} 条` : '') +
       (CLOUD_MODE ? '，收信走云端' : ''));
@@ -1520,10 +1656,15 @@ async function main() {
   // 而那一刻消息往往已经被云端取走（taken），进程一死就等于把消息丢了，
   // 45 分钟后云端才放回队列重投 —— 表现为「同一条消息被回答两次」或「石沉大海」。
   // 现在：处理中一律豁免，只留一条硬上限（回复超时 + 5 分钟）兜底真卡死。
-  setInterval(() => {
+  setInterval(async () => {
     if (busySince) {
       if (Date.now() - busySince <= REPLY_TIMEOUT + 300000) return;
       log('看门狗：单条消息处理已超过硬上限，退出进程等待重启。');
+      // 退出前必须先取消服务端 run，否则它变成僵尸，重启后所有新消息都会被 429 挡住
+      const stuck = [...liveRuns];
+      if (stuck.length) log(`退出前取消 ${stuck.length} 个悬着的 run`);
+      for (const rid of stuck) await cancelRun(rid);
+      clearRun();
       process.exit(1);
     }
     if (Date.now() - lastLoopAt > 240000) {

@@ -312,6 +312,38 @@ def check_hub(fix=True):
     return r
 
 
+# ---------------------------------------------------------------- 声音段
+
+def check_audio(fix=True):
+    """重启后 macOS 常把默认输出挑到 HDMI，而 BenQ GW2455 没有喇叭 → 整台没声音。
+    已在 audio_default.py 里用系统 API 处理，这里只负责调用与留证据。"""
+    r = {"name": "音频输出", "ok": True, "notes": [], "fixed": [], "evidence": {}}
+    try:
+        import audio_default as A
+    except Exception as exc:                      # 模块缺失不该拖垮整个自检
+        r["notes"].append("音频模块不可用（%s）" % exc)
+        return r
+    try:
+        if fix:
+            changed, before, after, msg = A.ensure_builtin()
+            if changed:
+                r["fixed"].append("默认输出已从 %s 切回 %s" % (
+                    (before or {}).get("name", "?"), (after or {}).get("name", "?")))
+        cur = next((d for d in A.snapshot() if d["default"]), None)
+        if not cur:
+            r["ok"] = False
+            r["notes"].append("读不到默认输出设备")
+        else:
+            r["evidence"] = {"name": cur["name"], "transport": cur["transport"], "id": cur["id"]}
+            if cur["transport"] == "hdmi":
+                r["ok"] = False
+                r["notes"].append("默认输出仍是 HDMI（显示器无喇叭，会没声音）")
+    except Exception as exc:
+        r["ok"] = False
+        r["notes"].append("音频检查异常：%s" % exc)
+    return r
+
+
 # ---------------------------------------------------------------- 报告
 
 def build_report(res, waited):
@@ -346,7 +378,15 @@ def build_report(res, waited):
     else:
         lines.append("雲端 ⚠️ %s" % "；".join(h["notes"] or ["未知异常"]))
 
-    fixed = [x for k in ("tele", "LINE", "hub") for x in res[k].get("fixed", [])]
+    a = res.get("audio") or {}
+    if a:
+        ev = a.get("evidence") or {}
+        if a.get("ok"):
+            lines.append("聲音 ✅ 預設輸出 %s（%s）" % (ev.get("name"), ev.get("transport")))
+        else:
+            lines.append("聲音 ❌ %s" % "；".join(a.get("notes") or ["未知异常"]))
+
+    fixed = [x for k in ("tele", "LINE", "hub", "audio") for x in res[k].get("fixed", [])]
     if fixed:
         lines.append("已自愈：" + "；".join(fixed))
 
@@ -385,6 +425,7 @@ def main():
     res["tele"] = check_tele(bridge, fix=fix)
     res["hub"] = check_hub(fix=fix)
     res["LINE"] = check_line(bridge, fix=fix)
+    res["audio"] = check_audio(fix=fix)
 
     # 出向实发（这也正是通知本身，一次完成「测试」与「报平安」）
     if notify:

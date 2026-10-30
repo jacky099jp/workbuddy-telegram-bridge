@@ -1,0 +1,51 @@
+{
+  "bridge/bridge.js": {
+    "mtime": 1792609485.6470013,
+    "seen": 1792781336.1753888,
+    "ast_hash": "db63369d76185652380da24720d6a513",
+    "semantic_hash": "db63369d76185652380da24720d6a513"
+  },
+  "bridge/config.example.json": {
+    "mtime": 1791649937.927476,
+    "seen": 1792781336.175602,
+    "ast_hash": "06b08d21ca347532a84a765a28c564ac",
+    "semantic_hash": "06b08d21ca347532a84a765a28c564ac",
+    "ast_empty": true
+  },
+  "bridge/start_bridge.py": {
+    "mtime": 1791649928.3591874,
+    "seen": 1792781336.1756108,
+    "ast_hash": "7c6fca8a63d6583b01f0231249d1bd01",
+    "semantic_hash": "7c6fca8a63d6583b01f0231249d1bd01"
+  },
+  "skill/scripts/_common.py": {
+    "mtime": 1791649915.36178,
+    "seen": 1792781336.175761,
+    "ast_hash": "d30e746d0f0065b07eb92a83fbcc93c1",
+    "semantic_hash": "d30e746d0f0065b07eb92a83fbcc93c1"
+  },
+  "skill/scripts/audio_default.py": {
+    "mtime": 1792740507.8727589,
+    "seen": 1792781336.175905,
+    "ast_hash": "ef053c3fc8dfecfdd44b49cb6ee99eef",
+    "semantic_hash": "ef053c3fc8dfecfdd44b49cb6ee99eef"
+  },
+  "skill/scripts/boot_check.py": {
+    "mtime": 1792740507.8706496,
+    "seen": 1792781336.176045,
+    "ast_hash": "a8d4353387cf2b2b3489d3a688dd8254",
+    "semantic_hash": "a8d4353387cf2b2b3489d3a688dd8254"
+  },
+  "skill/scripts/bridge_ctl.py": {
+    "mtime": 1792124902.5106359,
+    "seen": 1792781336.1761842,
+    "ast_hash": "c9734722baca94e37400ccac8e67bcfb",
+    "semantic_hash": "c9734722baca94e37400ccac8e67bcfb"
+  },
+  "skill/scripts/tg_send.py": {
+    "mtime": 1791649915.3489013,
+    "seen": 1792781336.176317,
+    "ast_hash": "f8cca4c6dc075738fa8ceaa695b09dee",
+    "semantic_hash": "f8cca4c6dc075738fa8ceaa695b09dee"
+  }
+}

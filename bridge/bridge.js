@@ -907,22 +907,62 @@ function listLocalPorts() {
   return [];
 }
 
+// 找出本机「自动化任务」占用的网关端口。
+// 【2026-10-30 事故】自动化子任务同样是 codebuddy --serve，命令里带 automationId，
+// 但它的 --serve 只会跑那一份自动化，投进去的消息永远等不到回复。
+// 旧逻辑按「最新 serve 进程」挑网关，每天体检自动化一启动就会把 Jack 的消息拐进自动化会话：
+// 表现为 SSE 404、或者挂 20 分钟直到看门狗杀进程 —— Jack 那边就是彻底沉默。
+// 结论：自动化会话的网关一律不算「可投递网关」。
+function automationPorts() {
+  const ports = new Set();
+  let ps = '';
+  try {
+    ps = execFileSync('/bin/ps', ['-eo', 'pid=,command='], { encoding: 'utf8', timeout: 5000 });
+  } catch (_) { return ports; }
+  for (const line of ps.split('\n')) {
+    if (!/codebuddy --serve/.test(line) || !/automationId/.test(line)) continue;
+    const pid = line.trim().split(/\s+/)[0];
+    if (!/^\d+$/.test(pid || '')) continue;
+    for (const bin of ['/usr/sbin/lsof', '/usr/bin/lsof']) {
+      try {
+        const out = execFileSync(bin, ['-nP', '-a', '-p', pid, '-iTCP', '-sTCP:LISTEN'], {
+          encoding: 'utf8', timeout: 5000,
+        });
+        for (const m of out.matchAll(/127\.0\.0\.1:(\d+)\s*\(LISTEN\)/g)) ports.add(m[1]);
+        break;
+      } catch (_) { /* 换下一个 lsof */ }
+    }
+  }
+  return ports;
+}
+
+// 端口是否属于自动化会话（属于则不可投递）
+function isAutomationBase(base, skipSet) {
+  const port = String(base || '').split(':').pop();
+  return (skipSet || automationPorts()).has(String(port));
+}
+
 // 定位可用网关：提示文件 → 当前 GW → config → 扫描监听端口
 async function resolveGateway() {
+  // 一次性算出自动化端口集合，避免每个候选都重新扫一遍 ps
+  const skipAuto = automationPorts();
+  const ok = async (base) => !!base && !isAutomationBase(base, skipAuto) && await probeHealth(base);
+
   // 密钥过期会让所有探测失败；WorkBuddy 重启后先尝试自愈一次
-  if (!(await probeHealth(readGwHint() || GW))) tryRefreshSecret();
+  if (!(await ok(readGwHint() || GW))) tryRefreshSecret();
 
   const hint = readGwHint();
-  if (hint && await probeHealth(hint)) return hint;
+  if (await ok(hint)) return hint;
 
-  if (await probeHealth(GW)) return GW;
+  if (await ok(GW)) return GW;
 
   const cfg = CONFIG.gateway;
-  if (cfg && cfg !== GW && await probeHealth(cfg)) return cfg;
+  if (cfg && cfg !== GW && await ok(cfg)) return cfg;
 
   for (const p of listLocalPorts()) {
     const base = `http://127.0.0.1:${p}`;
     if (base === GW || base === hint) continue;
+    if (skipAuto.has(String(p))) continue;
     if (await probeHealth(base)) return base;
   }
   return null;
@@ -948,6 +988,8 @@ function newestServeGateway() {
     let bestAge = Infinity;
     for (const line of out.split('\n')) {
       if (!/codebuddy --serve/.test(line) || /--prewarm/.test(line)) continue;
+      // 【2026-10-30】自动化会话（automationId）不可作为投递目标，理由见 automationPorts()
+      if (/automationId/.test(line)) continue;
       const m = line.trim().match(/^(\d+)\s+(\S+)\s+(.*)$/);
       if (!m) continue;
       const age = parseEtime(m[2]);
@@ -978,6 +1020,7 @@ async function withGateway(fn) {
 
     const tried = new Set();
     const candidates = [];
+    const skipAuto = automationPorts();   // 【2026-10-30】自动化会话一律不投
     const fresh = newestServeGateway();
     if (fresh) candidates.push(fresh);
     for (const extra of [readGwHint(), GW, CONFIG.gateway]) if (extra) candidates.push(extra);
@@ -987,6 +1030,7 @@ async function withGateway(fn) {
     for (const base of candidates) {
       if (!base || tried.has(base) || base === GW) continue;
       tried.add(base);
+      if (isAutomationBase(base, skipAuto)) continue;
       if (!(await probeHealth(base))) continue;
       GW = base;
       try { fs.writeFileSync(GW_HINT_FILE, base.split(':').pop()); } catch (_) {}
@@ -1295,8 +1339,8 @@ async function awaitReplyOnce(runId) {
 // 都发生在收信后 302~303 秒，非常规律（空闲约 300 秒即断）。
 // 断流时 run 往往还在跑，绝不能就此放弃：重连同一个 runId 继续等。
 // 重连是只读、幂等的，不会在 WorkBuddy 里产生重复消息。
-const REPLY_STREAM_RETRIES = 3;
-const REPLY_STREAM_GAP_MS = 5000;
+const REPLY_STREAM_RETRIES = 12;
+const REPLY_STREAM_GAP_MS = 10000;
 
 async function awaitReply(runId) {
   let lastErr = null;
@@ -1419,6 +1463,28 @@ async function handleMessage(msg, cloudId) {
   }
   log(`收到 ${chatId}: ${text.slice(0, 80)}`);
 
+  // 【2026-10-30】投递前先确认「本机确实有一个能答话的用户会话」。
+  // 没有的话（例如对话窗口已关、只剩自动化会话在跑），绝不硬投：
+  // 投进自动化会话只会 SSE 404 / 挂到看门狗，Jack 那边就是彻底沉默。
+  // 这时直接交棒云端，让云端立刻代答。
+  const userGw = await resolveGateway();
+  if (!userGw) {
+    log(`没有可用的用户会话网关（自动化会话不计），交棒云端: ${text.slice(0, 40)}`);
+    if (cloudId) { await cloudHandoff(cloudId); return false; }
+    const dup0 = pending.find((p) => p.chatId === chatId && p.text === text);
+    if (!dup0) {
+      pending.push({ chatId, userId, text, at: Date.now(), tries: 0 });
+      savePending(pending);
+    }
+    await tgSend(chatId, 'WorkBuddy 的对话窗口现在没开着，这条我先记着；窗口一打开我马上回你。');
+    return false;
+  }
+  if (userGw !== GW) {
+    GW = userGw;
+    try { fs.writeFileSync(GW_HINT_FILE, GW.split(':').pop()); } catch (_) {}
+    log('投递前锁定用户会话网关 -> ' + GW);
+  }
+
   await tgSend(chatId, '收到，正在处理…');
 
   try {
@@ -1435,7 +1501,7 @@ async function handleMessage(msg, cloudId) {
       // 讯息已真正送达并处理，只是回复没取回 —— 绝不重投（会重复）
       // 【2026-10-12】补上真因，否则永远不知道是超时、断流还是 Agent 自身报错。
       log(`已送达但回复未取回（真因: ${((e && e.message) || e).slice(0, 180)}）: ${text.slice(0, 40)}`);
-      await tgSend(chatId, '这条我已经收到并处理了，只是回复在回传时丢了。不用重发，结果我稍后直接推给你。');
+      await tgSend(chatId, '这条我收到了，AI 也开始处理了，但回复回传时通道断线，结果拿不回来。麻烦把原话再发一次，我马上重新答。');
       return true;
     } else if (isTransientErr(e)) {
       // 云端来的消息，本机接不了时绝不能自己攥着不放：
@@ -1457,7 +1523,7 @@ async function handleMessage(msg, cloudId) {
               return true;
             } catch (e0) {
               if (e0.delivered) {
-                await tgSend(chatId, '这条我已经收到并处理了，只是回复在回传时丢了。不用重发，结果我稍后直接推给你。');
+                await tgSend(chatId, '这条我收到了，AI 也开始处理了，但回复回传时通道断线，结果拿不回来。麻烦把原话再发一次，我马上重新答。');
                 return true;
               }
               log(`清僵尸后仍受阻（${e0.message}）: ${text.slice(0, 30)}`);
@@ -1475,7 +1541,7 @@ async function handleMessage(msg, cloudId) {
             return true;
           } catch (e1) {
             if (e1.delivered) {
-              await tgSend(chatId, '这条我已经收到并处理了，只是回复在回传时丢了。不用重发，结果我稍后直接推给你。');
+              await tgSend(chatId, '这条我收到了，AI 也开始处理了，但回复回传时通道断线，结果拿不回来。麻烦把原话再发一次，我马上重新答。');
               return true;
             }
             log(`换道逃生仍失败（${e1.message}）: ${text.slice(0, 30)}`);
@@ -1492,7 +1558,7 @@ async function handleMessage(msg, cloudId) {
           } catch (e2) {
             if (e2.delivered) {
               log(`重试时确认已送达（回复未取回，真因: ${((e2 && e2.message) || e2).slice(0, 180)}），不再重投: ${text.slice(0, 40)}`);
-              await tgSend(chatId, '这条我已经收到并处理了，只是回复在回传时丢了。不用重发，结果我稍后直接推给你。');
+              await tgSend(chatId, '这条我收到了，AI 也开始处理了，但回复回传时通道断线，结果拿不回来。麻烦把原话再发一次，我马上重新答。');
               return true;
             }
             if (!isTransientErr(e2)) return true;

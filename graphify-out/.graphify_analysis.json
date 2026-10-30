@@ -1,0 +1,383 @@
+{
+  "communities": {
+    "0": [
+      "bridge_bridge",
+      "bridge_bridge_allow",
+      "bridge_bridge_cloud_url",
+      "bridge_bridge_config",
+      "bridge_bridge_exitbusy",
+      "bridge_bridge_ext_by_mime",
+      "bridge_bridge_gw_hint_file",
+      "bridge_bridge_harvestgatewayenv",
+      "bridge_bridge_heartbeat_file",
+      "bridge_bridge_line_held_file",
+      "bridge_bridge_liveruns",
+      "bridge_bridge_loadpending",
+      "bridge_bridge_log_file",
+      "bridge_bridge_markrun",
+      "bridge_bridge_newestservegateway",
+      "bridge_bridge_parseetime",
+      "bridge_bridge_pending",
+      "bridge_bridge_pending_file",
+      "bridge_bridge_prunemedia",
+      "bridge_bridge_run_state_file",
+      "bridge_bridge_secret_file",
+      "bridge_bridge_startrun",
+      "bridge_bridge_state_file",
+      "bridge_bridge_stop_file",
+      "bridge_bridge_stopcloudping",
+      "bridge_bridge_stoplineping",
+      "bridge_bridge_tryrefreshsecret",
+      "bridge_bridge_writesecretfile",
+      "ref_child_process",
+      "ref_fs",
+      "ref_os",
+      "ref_path"
+    ],
+    "1": [
+      "os",
+      "platform",
+      "skill_scripts_bridge_ctl",
+      "skill_scripts_bridge_ctl_bootstrap",
+      "skill_scripts_bridge_ctl_check_awake",
+      "skill_scripts_bridge_ctl_check_gateway",
+      "skill_scripts_bridge_ctl_check_pending",
+      "skill_scripts_bridge_ctl_check_secret",
+      "skill_scripts_bridge_ctl_cmd_install",
+      "skill_scripts_bridge_ctl_cmd_logs",
+      "skill_scripts_bridge_ctl_cmd_pending",
+      "skill_scripts_bridge_ctl_cmd_refresh",
+      "skill_scripts_bridge_ctl_cmd_restart",
+      "skill_scripts_bridge_ctl_cmd_start",
+      "skill_scripts_bridge_ctl_cmd_status",
+      "skill_scripts_bridge_ctl_cmd_stop",
+      "skill_scripts_bridge_ctl_cmd_uninstall",
+      "skill_scripts_bridge_ctl_ensure_bridge_plist",
+      "skill_scripts_bridge_ctl_find_node",
+      "skill_scripts_bridge_ctl_launchctl",
+      "skill_scripts_bridge_ctl_main",
+      "skill_scripts_bridge_ctl_pgrep_bridge",
+      "skill_scripts_bridge_ctl_plist_changed",
+      "skill_scripts_bridge_ctl_process_etime",
+      "skill_scripts_bridge_ctl_rationale_3",
+      "skill_scripts_bridge_ctl_rationale_307",
+      "skill_scripts_bridge_ctl_rationale_328",
+      "skill_scripts_bridge_ctl_service_state",
+      "skill_scripts_bridge_ctl_write_plist",
+      "subprocess"
+    ],
+    "2": [
+      "re",
+      "skill_scripts_common",
+      "skill_scripts_common_bridge_dir_candidates",
+      "skill_scripts_common_chunk_text",
+      "skill_scripts_common_die",
+      "skill_scripts_common_find_bridge_dir",
+      "skill_scripts_common_gateway_health",
+      "skill_scripts_common_html_escape",
+      "skill_scripts_common_http_get",
+      "skill_scripts_common_load_secret",
+      "skill_scripts_common_main_guard",
+      "skill_scripts_common_ok",
+      "skill_scripts_common_rationale_154",
+      "skill_scripts_common_rationale_199",
+      "skill_scripts_common_rationale_216",
+      "skill_scripts_common_rationale_3",
+      "skill_scripts_common_rationale_71",
+      "skill_scripts_common_rationale_82",
+      "skill_scripts_common_rationale_96",
+      "skill_scripts_common_read_gwport",
+      "skill_scripts_common_remember_bridge_dir",
+      "skill_scripts_common_scan_gateway_port",
+      "urllib_error",
+      "urllib_parse",
+      "urllib_request"
+    ],
+    "3": [
+      "skill_scripts_boot_check",
+      "skill_scripts_boot_check_build_report",
+      "skill_scripts_boot_check_check_audio",
+      "skill_scripts_boot_check_check_hub",
+      "skill_scripts_boot_check_check_line",
+      "skill_scripts_boot_check_check_tele",
+      "skill_scripts_boot_check_http_json",
+      "skill_scripts_boot_check_load_line_cfg",
+      "skill_scripts_boot_check_main",
+      "skill_scripts_boot_check_owner_uid_from_log",
+      "skill_scripts_boot_check_rationale_149",
+      "skill_scripts_boot_check_rationale_174",
+      "skill_scripts_boot_check_rationale_190",
+      "skill_scripts_boot_check_rationale_3",
+      "skill_scripts_boot_check_rationale_318",
+      "skill_scripts_boot_check_rationale_58",
+      "skill_scripts_boot_check_rationale_85",
+      "skill_scripts_boot_check_send_line",
+      "skill_scripts_boot_check_send_tele",
+      "skill_scripts_boot_check_sh",
+      "time"
+    ],
+    "4": [
+      "ctypes",
+      "skill_scripts_audio_default",
+      "skill_scripts_audio_default_addr",
+      "skill_scripts_audio_default_addr_486f5c",
+      "skill_scripts_audio_default_builtin_output",
+      "skill_scripts_audio_default_cc",
+      "skill_scripts_audio_default_device_ids",
+      "skill_scripts_audio_default_device_name",
+      "skill_scripts_audio_default_ensure_builtin",
+      "skill_scripts_audio_default_get_default",
+      "skill_scripts_audio_default_is_output",
+      "skill_scripts_audio_default_main",
+      "skill_scripts_audio_default_rationale_129",
+      "skill_scripts_audio_default_rationale_3",
+      "skill_scripts_audio_default_rationale_88",
+      "skill_scripts_audio_default_set_default",
+      "skill_scripts_audio_default_snapshot",
+      "skill_scripts_audio_default_transport",
+      "skill_scripts_audio_default_u32"
+    ],
+    "5": [
+      "bridge_bridge_addheld",
+      "bridge_bridge_asrfromline",
+      "bridge_bridge_clearheld",
+      "bridge_bridge_groupwho",
+      "bridge_bridge_iscallingxiaoyao",
+      "bridge_bridge_lineapi",
+      "bridge_bridge_linelog",
+      "bridge_bridge_linequeuenotice",
+      "bridge_bridge_linetick",
+      "bridge_bridge_mediafromline",
+      "bridge_bridge_mediainstruction",
+      "bridge_bridge_peekheld",
+      "bridge_bridge_readheld",
+      "bridge_bridge_savemedia",
+      "bridge_bridge_startlineping",
+      "bridge_bridge_tgnotifyjack",
+      "bridge_bridge_writeheld"
+    ],
+    "6": [
+      "bridge_start_bridge",
+      "bridge_start_bridge_alive",
+      "bridge_start_bridge_current_pid",
+      "bridge_start_bridge_find_node",
+      "bridge_start_bridge_main",
+      "bridge_start_bridge_rationale_18",
+      "bridge_start_bridge_rationale_3",
+      "skill_scripts_tg_send",
+      "skill_scripts_tg_send_main",
+      "skill_scripts_tg_send_parse_args",
+      "skill_scripts_tg_send_rationale_3",
+      "skill_scripts_tg_send_read_input",
+      "sys"
+    ],
+    "7": [
+      "bridge_bridge_awaitreply",
+      "bridge_bridge_awaitreplyonce",
+      "bridge_bridge_clearrun",
+      "bridge_bridge_cloudgetupdates",
+      "bridge_bridge_deliver",
+      "bridge_bridge_listlocalports",
+      "bridge_bridge_probehealth",
+      "bridge_bridge_readgwhint",
+      "bridge_bridge_resolvegateway",
+      "bridge_bridge_sleep",
+      "bridge_bridge_tggetupdates",
+      "bridge_bridge_withgateway"
+    ],
+    "8": [
+      "bridge_bridge_beat",
+      "bridge_bridge_cloudack",
+      "bridge_bridge_cloudhandoff",
+      "bridge_bridge_cloudheaders",
+      "bridge_bridge_cloudrecover",
+      "bridge_bridge_enterbusy",
+      "bridge_bridge_loadstate",
+      "bridge_bridge_main",
+      "bridge_bridge_savestate",
+      "bridge_bridge_startcloudping"
+    ],
+    "9": [
+      "bridge_bridge_asrfromtelegram",
+      "bridge_bridge_asrtranscribe",
+      "bridge_bridge_cancelrun",
+      "bridge_bridge_clearstaleon429",
+      "bridge_bridge_log",
+      "bridge_bridge_readsecret",
+      "bridge_bridge_sweeporphanrun",
+      "bridge_bridge_trywakeworkbuddy",
+      "bridge_bridge_workbuddyrunning"
+    ],
+    "10": [
+      "bridge_bridge_cloudsend",
+      "bridge_bridge_flushpending",
+      "bridge_bridge_handlemessage",
+      "bridge_bridge_istransienterr",
+      "bridge_bridge_mediafromtelegram",
+      "bridge_bridge_notifyrecoverifdue",
+      "bridge_bridge_removepending",
+      "bridge_bridge_savepending",
+      "bridge_bridge_tgsend"
+    ],
+    "11": [
+      "exception",
+      "json",
+      "skill_scripts_bridge_ctl_check_heartbeat",
+      "skill_scripts_bridge_ctl_rationale_147",
+      "skill_scripts_common_load_config",
+      "skill_scripts_common_rationale_118",
+      "skill_scripts_common_tg_call",
+      "skill_scripts_common_tgerror"
+    ]
+  },
+  "cohesion": {
+    "0": 0.07258064516129033,
+    "1": 0.19310344827586207,
+    "2": 0.10666666666666667,
+    "3": 0.20476190476190476,
+    "4": 0.2573099415204678,
+    "5": 0.19852941176470587,
+    "6": 0.21794871794871795,
+    "7": 0.25757575757575757,
+    "8": 0.26666666666666666,
+    "9": 0.3333333333333333,
+    "10": 0.3055555555555556,
+    "11": 0.25
+  },
+  "gods": [
+    {
+      "id": "bridge_bridge_log",
+      "label": "log()",
+      "degree": 23
+    },
+    {
+      "id": "bridge_bridge_main",
+      "label": "main()",
+      "degree": 19
+    },
+    {
+      "id": "bridge_bridge_linetick",
+      "label": "lineTick()",
+      "degree": 17
+    },
+    {
+      "id": "bridge_bridge_handlemessage",
+      "label": "handleMessage()",
+      "degree": 13
+    },
+    {
+      "id": "skill_scripts_bridge_ctl_cmd_start",
+      "label": "cmd_start()",
+      "degree": 12
+    },
+    {
+      "id": "bridge_bridge_deliver",
+      "label": "deliver()",
+      "degree": 12
+    },
+    {
+      "id": "skill_scripts_bridge_ctl_cmd_status",
+      "label": "cmd_status()",
+      "degree": 11
+    },
+    {
+      "id": "skill_scripts_boot_check_main",
+      "label": "main()",
+      "degree": 11
+    },
+    {
+      "id": "skill_scripts_bridge_ctl_main",
+      "label": "main()",
+      "degree": 10
+    },
+    {
+      "id": "bridge_bridge_flushpending",
+      "label": "flushPending()",
+      "degree": 9
+    }
+  ],
+  "surprises": [
+    {
+      "source": "lineTick()",
+      "target": "exitBusy()",
+      "source_files": [
+        "bridge/bridge.js",
+        "bridge/bridge.js"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "calls",
+      "note": "Bridges community 0 → community 5"
+    },
+    {
+      "source": "main()",
+      "target": "exitBusy()",
+      "source_files": [
+        "bridge/bridge.js",
+        "bridge/bridge.js"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "calls",
+      "note": "Bridges community 0 → community 8"
+    },
+    {
+      "source": "withGateway()",
+      "target": "newestServeGateway()",
+      "source_files": [
+        "bridge/bridge.js",
+        "bridge/bridge.js"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "calls",
+      "note": "Bridges community 0 → community 7"
+    },
+    {
+      "source": "startRun()",
+      "target": "readSecret()",
+      "source_files": [
+        "bridge/bridge.js",
+        "bridge/bridge.js"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "calls",
+      "note": "Bridges community 0 → community 9"
+    },
+    {
+      "source": "check_pending()",
+      "target": "json",
+      "source_files": [
+        "skill/scripts/bridge_ctl.py",
+        ""
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "calls",
+      "note": "Bridges community 1 → community 11"
+    }
+  ],
+  "questions": [
+    {
+      "type": "bridge_node",
+      "question": "Why does `main()` connect `boot_check.py` to `bridge_ctl.py`, `json`, `sys`?",
+      "why": "High betweenness centrality (0.010) - this node is a cross-community bridge."
+    },
+    {
+      "type": "low_cohesion",
+      "question": "Should `bridge.js` be split into smaller, more focused modules?",
+      "why": "Cohesion score 0.07258064516129033 - nodes in this community are weakly interconnected."
+    },
+    {
+      "type": "bridge_node",
+      "question": "Why does `check_line()` connect `boot_check.py` to `bridge_ctl.py`?",
+      "why": "High betweenness centrality (0.008) - this node is a cross-community bridge."
+    },
+    {
+      "type": "low_cohesion",
+      "question": "Should `_common.py` be split into smaller, more focused modules?",
+      "why": "Cohesion score 0.10666666666666667 - nodes in this community are weakly interconnected."
+    },
+    {
+      "type": "bridge_node",
+      "question": "Why does `tg_call()` connect `json` to `_common.py`, `boot_check.py`?",
+      "why": "High betweenness centrality (0.006) - this node is a cross-community bridge."
+    }
+  ]
+}

@@ -1067,6 +1067,9 @@ function isTransientErr(e) {
 // 而云端看到消息已被领走（taken），以为本机在处理，就不介入了。
 // 结果：Jack 一条回复都收不到。所以管道不通时，宁可什么都不做，让云端顶上。
 let lastSkipLogAt = 0;
+// 2026-10-31：断线中也要主动出声。实测 Jack 在网关消失的 12 分钟里连发多条「堵了吗」，
+// 桥接只在本地日志记「网关不通」，他完全不知道发生了什么 —— 只加恢复通知不够。
+let gwAlertAt = 0;
 // 断线感知：gwDownSince（网关开始不通的时刻，0=通）由下方「通道自养」区块统一持有；
 // 这里只负责「恢复后通知用户」，与自养共用同一状态，恢复时清零。
 let gwNotifyAt = 0;
@@ -1115,6 +1118,18 @@ async function cloudGetUpdates(timeoutSec) {
     if (Date.now() - lastSkipLogAt > 60000) {
       lastSkipLogAt = Date.now();
       log('本机网关不通，本轮不去云端取信（交给云端自己答）');
+    }
+    // 断线超过 3 分钟就直发告警（10 分钟内最多一次），恢复时 notifyRecoverIfDue 会再报一次
+    const gwDownMs = Date.now() - gwDownSince;
+    if (gwDownMs > 180000 && Date.now() - gwAlertAt > 600000) {
+      gwAlertAt = Date.now();
+      const mins = Math.round(gwDownMs / 60000);
+      for (const chatId of ALLOW) {
+        try {
+          await tgSend(chatId, `⚠️ 本机 WorkBuddy 网关已连不上 ${mins} 分钟，桥接在自动重试（不用管）。你发的消息会排队，恢复后一起补进来，不用重发。`);
+        } catch (_) { /* 告警失败不碍事 */ }
+      }
+      log(`网关断开 ${mins} 分钟，已直发告警`);
     }
     await sleep(15000);
     return [];

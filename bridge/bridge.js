@@ -738,11 +738,13 @@ function exitBusy() {
   }
 }
 
-// 待补发讯息最多保留 30 分钟、最多尝试 5 次。
+// 待补发讯息最多保留 2 小时、最多尝试 200 次（2026-11-07 去云端后调长）。
 // 说明：只有「讯息压根没投进网关」才需要补发；一旦投进（run 已创建）就绝不重投，
 // 否则同一句话会在 WorkBuddy 里被处理多次（就是重复讯息的根源）。
-const PENDING_MAX_AGE_MS = 30 * 60 * 1000;
-const PENDING_MAX_TRIES = 30;
+// 【为什么改长】云端兜底停用后，本机是唯一通道：WorkBuddy 被杀/重开可能十几分钟，
+// 30 分钟就放弃等于把 Jack 的话丢掉。留 2 小时，等他电脑回来再答；真放弃会明说。
+const PENDING_MAX_AGE_MS = 2 * 60 * 60 * 1000;
+const PENDING_MAX_TRIES = 200;
 // 网关端口漂移的窗口期约 5~15 秒，用短间隔快试，别让讯息卡上几分钟
 const PENDING_RETRY_MS = 5000;
 const RATE_LIMIT_BACKOFF_MS = 60 * 1000;
@@ -1954,9 +1956,12 @@ async function flushPending() {
         // 重复 run（2026-10-11 实测 25 秒一次、堆了 3 个、同样的问题刷了三次）。
         // 改成 60s → 120s → …（上限 5 分钟）：既等它空出来，又不重复。
         // 纯端口抖动仍是 5 秒，秒级自愈。
+        // 前 6 次仍 5 秒快试（端口漂移窗口就那十几秒，必须赶得上）；
+        // 之后逐步退到 60 秒一次 —— WorkBuddy 被关掉几十分钟也不会把话丢光。
+        const _t = item.tries || 1;
         await sleep(e.message === 'RATE_LIMITED'
-          ? Math.min(RATE_LIMIT_BACKOFF_MS * (item.tries || 1), 300 * 1000)
-          : PENDING_RETRY_MS);
+          ? Math.min(RATE_LIMIT_BACKOFF_MS * _t, 300 * 1000)
+          : (_t <= 6 ? PENDING_RETRY_MS : Math.min(PENDING_RETRY_MS * (_t - 5), 60 * 1000)));
         return;
       }
     }

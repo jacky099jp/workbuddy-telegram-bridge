@@ -760,6 +760,26 @@ const GW_CHECK_MS = 5 * 1000;
 // 网关地址：启动后由 resolveGateway() 动态确定
 let GW = CONFIG.gateway || 'http://127.0.0.1:52116';
 
+// 【2026-11-05 20:35】无登录态网关黑名单。
+// 背景：今晚 20:23 桥接把一个跑了 8 小时的旧 --serve 进程（9527）当正式网关，
+// 它 health 200 但账号登录态已失效 → 每条消息都回 AuthenticationRequiredError，
+// Jack 以为是自己被登出。health 探针查不出「有没有登录态」，只能靠回复内容识别。
+// 识别到就把该端口拉黑，30 分钟内不再选它，并立刻重定位到真正能答话的网关。
+const BAD_GW = new Map();   // port -> 拉黑到期时间戳
+const BAD_GW_MS = 30 * 60 * 1000;
+function markBadGw(base) {
+  const port = String(base || '').split(':').pop();
+  if (!port) return;
+  BAD_GW.set(port, Date.now() + BAD_GW_MS);
+}
+function isBadGw(base) {
+  const port = String(base || '').split(':').pop();
+  const until = BAD_GW.get(port);
+  if (!until) return false;
+  if (Date.now() > until) { BAD_GW.delete(port); return false; }
+  return true;
+}
+
 // ---------- 基础工具 ----------
 
 function log(...args) {
@@ -773,7 +793,20 @@ function log(...args) {
   } catch (_) { /* 日志失败不影响主流程 */ }
 }
 
+const FB_PORT = Number(process.env.BRIDGE_FALLBACK_PORT || 56999);
+const FB_SECRET_FILE = path.join(DIR, 'fb-secret');
+const FB_CLI = '/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy';
+const FB_CWD = '/Users/macmini/WorkBuddy/bridge-gateway';
+
+function fbSecret() {
+  try { return fs.readFileSync(FB_SECRET_FILE, 'utf8').trim(); } catch (_) { return ''; }
+}
+function fbBase() { return `http://127.0.0.1:${FB_PORT}`; }
+function isFallback(base) { return String(base || '').endsWith(':' + FB_PORT); }
+
 function readSecret() {
+  // 兜底网关用自己固定的密钥，不与 WorkBuddy 界面网关的轮换密钥混用
+  if (isFallback(GW)) { const s = fbSecret(); if (s) return s; }
   const fromEnv = process.env.CODEBUDDY_GATEWAY_PASSWORD;
   if (fromEnv && fromEnv.trim()) return fromEnv.trim();
   try {
@@ -878,8 +911,60 @@ function readGwHint() {
 }
 
 // 探测某地址是否为本机网关（/api/v1/health 用密钥返回 200）
+async function probeWith(base, secret) {
+  if (!secret) return false;
+  try {
+    const res = await fetch(`${base}/api/v1/health`, {
+      headers: { 'x-access-token': secret, 'x-codebuddy-request': '1' },
+      signal: AbortSignal.timeout(4000),
+    });
+    return res.status === 200;
+  } catch (_) { return false; }
+}
+
+// 【2026-11-04】兜底网关：WorkBuddy 界面里的对话被关掉就没网关（no-session），
+// 而且每次新对话都换端口+换密钥（今天实测漂移 8 次、流断 47 次）。
+// 对策：桥接自己起一个固定端口、固定密钥的无头网关顶上，界面开不开都不影响通道。
+let fbSpawnAt = 0;
+async function ensureFallbackGateway() {
+  // 【2026-11-04 23:28 停用】实测无头网关没有 WorkBuddy 登录态，
+  // 投进去只会回 AuthenticationRequiredError，比不通更糟（Jack 以为被登出）。
+  // 永久关闭，等找到能复用登录态的方式再启用。
+  log('兜底网关已停用（无登录态），跳过');
+  return false;
+  const s = fbSecret();
+  if (!s) { log('兜底网关：没有密钥文件 fb-secret，跳过'); return false; }
+  if (await probeWith(fbBase(), s)) return true;
+  if (Date.now() - fbSpawnAt < 120000) return false;   // 2 分钟内不重复拉起
+  fbSpawnAt = Date.now();
+  try {
+    const fd = fs.openSync(path.join(DIR, 'fallback-gateway.log'), 'a');
+    const cp = require('child_process').spawn(
+      FB_CLI,
+      ['--serve', '--port', String(FB_PORT), '--permission-mode', 'bypassPermissions'],
+      {
+        detached: true,
+        cwd: FB_CWD,
+        stdio: ['ignore', fd, fd],
+        env: Object.assign({}, process.env, { CODEBUDDY_GATEWAY_PASSWORD: s }),
+      }
+    );
+    cp.unref();
+    log(`兜底网关：已拉起无头网关（端口 ${FB_PORT}）`);
+  } catch (e) {
+    log('兜底网关：拉起失败 ' + ((e && e.message) || e));
+    return false;
+  }
+  for (let i = 0; i < 40; i++) {
+    await new Promise((r) => setTimeout(r, 1000));
+    if (await probeWith(fbBase(), s)) { log('兜底网关：已就绪'); return true; }
+  }
+  log('兜底网关：40 秒内未就绪');
+  return false;
+}
+
 async function probeHealth(base) {
-  const secret = readSecret();
+  const secret = isFallback(base) ? fbSecret() : readSecret();
   if (!secret) return false;
   try {
     const res = await fetch(`${base}/api/v1/health`, {
@@ -887,6 +972,42 @@ async function probeHealth(base) {
       signal: AbortSignal.timeout(3000),
     });
     return res.status === 200;
+  } catch (_) {
+    return false;
+  }
+}
+
+// 【2026-11-06】授权卡死探测。「某会话的 run 停在 waiting_for_permission」时，
+// 该会话之后投进去的消息只会排队，等多久都不会被执行 —— Jack 那边就是「发了没回应」，
+// 而 bridge_ctl status / 看护全绿也看不出来（它们只看进程、端口、心跳）。
+// 实测 daemon/restart 只能换出一个「无登录态」的 daemon，清不掉应用主网关里泄漏的会话锁，
+// 所以这里做「换道」：确认卡死超过宽限期后，把消息投到另一个 conversation id（新会话）上。
+let permLockFirstSeen = 0;
+let permEscSeq = 0;
+
+async function gwPermLocked() {
+  const secret = isFallback(GW) ? fbSecret() : readSecret();
+  if (!secret) return false;
+  try {
+    const res = await fetch(`${GW}/api/v1/status`, {
+      headers: { 'x-access-token': secret, 'x-codebuddy-request': '1' },
+      signal: AbortSignal.timeout(3000),
+    });
+    if (res.status !== 200) return false;
+    const j = await res.json().catch(() => ({}));
+    const d = (j && j.data) || {};
+    if (!(d.busy === true && d.runStatus === 'waiting_for_permission')) {
+      if (permLockFirstSeen) log('网关授权卡死已解除，回到原会话');
+      permLockFirstSeen = 0;
+      return false;
+    }
+    if (!permLockFirstSeen) {
+      permLockFirstSeen = Date.now();
+      log('网关有会话卡在等授权 → 本条改走新会话，避免整条 tele 沉默');
+    }
+    // 投递前桥接手上没有任何 run，此刻看到的 waiting_for_permission 必然不是自己的，
+    // 所以不需要宽限期：直接换道，否则第一条消息就得白等 15 分钟。
+    return true;
   } catch (_) {
     return false;
   }
@@ -946,7 +1067,7 @@ function isAutomationBase(base, skipSet) {
 async function resolveGateway() {
   // 一次性算出自动化端口集合，避免每个候选都重新扫一遍 ps
   const skipAuto = automationPorts();
-  const ok = async (base) => !!base && !isAutomationBase(base, skipAuto) && await probeHealth(base);
+  const ok = async (base) => !!base && !isBadGw(base) && !isAutomationBase(base, skipAuto) && await probeHealth(base);
 
   // 密钥过期会让所有探测失败；WorkBuddy 重启后先尝试自愈一次
   if (!(await ok(readGwHint() || GW))) tryRefreshSecret();
@@ -1053,7 +1174,7 @@ function isTransientErr(e) {
   if (e && e.delivered) return false;
   const m = (e && e.message) || '';
   return m === 'BAD_SECRET' || m === 'NO_SECRET' || m === 'RATE_LIMITED' ||
-    /fetch failed|ECONN|socket|network|aborted|ETIMEDOUT|ECONNRESET|网关返回 5\d\d/i.test(m);
+    /fetch failed|ECONN|socket|network|aborted|ETIMEDOUT|ECONNRESET|网关返回 5\d\d|PROVIDER_DOWN/i.test(m);
 }
 
 // ---------- Telegram ----------
@@ -1112,6 +1233,28 @@ function stopCloudPing() {
   if (cloudPingTimer) { clearInterval(cloudPingTimer); cloudPingTimer = null; }
 }
 
+// 【2026-11-04】区分「等一等会回来」和「必须 Jack 点一下才回来」。
+// 已知事实（2026-11-04 实测）：本机网关是「每个打开着的对话一个 codebuddy --serve 进程」，
+// 没有打开的对话就没有网关；而重启 WorkBuddy 并不会自己打开对话 —— 09:04 重启后 2 小时仍无网关。
+// 换端口救不了、刷密钥救不了、重启应用也救不了，只能由人在窗口里点开一个对话。
+// 旧告警一律说「不用管」，Jack 照做之后一直等，结果断了 3 小时。
+function appProcessAlive() {
+  try {
+    const out = execFileSync('/bin/ps', ['-eo', 'command='], { encoding: 'utf8', timeout: 5000 });
+    // 【2026-11-04 修复】与 workbuddyRunning 同因：只认「命令行就是主程序路径本身」的主窗口
+    // 进程，避免残留守护/边车进程被误判成应用还活着（诊断成 probe-fail 而不是 app-dead）。
+    const BIN = '/Applications/WorkBuddy.app/Contents/MacOS/Electron';
+    return out.split('\n').some((line) => line.trim() === BIN);
+  } catch (_) { return false; }
+}
+
+// 返回 'app-dead'（主程序没跑）/ 'no-session'（应用开着但没有对话，需要人点）/ 'probe-fail'
+function gatewayDiagnosis() {
+  if (!appProcessAlive()) return 'app-dead';
+  if (!newestServeGateway()) return 'no-session';
+  return 'probe-fail';
+}
+
 async function cloudGetUpdates(timeoutSec) {
   if (!(await probeHealth(GW))) {
     if (!gwDownSince) gwDownSince = Date.now();
@@ -1119,18 +1262,43 @@ async function cloudGetUpdates(timeoutSec) {
       lastSkipLogAt = Date.now();
       log('本机网关不通，本轮不去云端取信（交给云端自己答）');
     }
-    // 断线超过 3 分钟就直发告警（10 分钟内最多一次），恢复时 notifyRecoverIfDue 会再报一次
+    // 断线超过 3 分钟就直发告警；【2026-11-04】告警按断线时长递进节流，
+    // 避免整夜断线时每 10 分钟一条把 Jack 的手机刷爆：
+    //   3~30 分钟：10 分钟一次；30 分钟~2 小时：30 分钟一次；2 小时以上：1 小时一次。
+    // 恢复时 notifyRecoverIfDue 会再报一次。
     const gwDownMs = Date.now() - gwDownSince;
-    if (gwDownMs > 180000 && Date.now() - gwAlertAt > 600000) {
+    const alertGap = gwDownMs < 1800000 ? 600000 : (gwDownMs < 7200000 ? 1800000 : 3600000);
+    if (gwDownMs > 180000 && Date.now() - gwAlertAt > alertGap) {
       gwAlertAt = Date.now();
       const mins = Math.round(gwDownMs / 60000);
+      const why = gatewayDiagnosis();
+      // 只有「应用开着但没对话」这一种，等是等不回来的，必须明说要他动手。
+      const alertText = why === 'no-session'
+        ? `⚠️ tele 通道断了，原因查清了：不是网络，也不是密钥。\n\nWorkBuddy 开着，但里面一个对话都没打开 —— 网关是跟着对话一起生灭的，没有对话就没有网关。重启应用、换端口、刷密钥都救不了，我这边点不了鼠标。\n\n【人不在电脑前也能救，三选一】\n① 手机打开 WorkBuddy App，给我发一句话（今天 00:57 你就是这么救活的）；\n② tele 直接回个「1」，我收到后会每 3 分钟再试自动重启，救回来马上告诉你；\n③ 回家后在电脑上随便点开一个对话，立刻恢复。\n\n（这段时间云端先代答，你发的消息不会丢。）`
+        : why === 'app-dead'
+          ? `⚠️ tele 通道断了 ${mins} 分钟：WorkBuddy 主程序没在跑，桥接会自己尝试拉起，你不用管。`
+          : `⚠️ 本机 WorkBuddy 网关已连不上 ${mins} 分钟，桥接在自动重试（不用管）。这段时间由云端先代答，你照常发消息就行。`;
       for (const chatId of ALLOW) {
         try {
-          await tgSend(chatId, `⚠️ 本机 WorkBuddy 网关已连不上 ${mins} 分钟，桥接在自动重试（不用管）。你发的消息会排队，恢复后一起补进来，不用重发。`);
+          await tgSend(chatId, alertText);
         } catch (_) { /* 告警失败不碍事 */ }
       }
-      log(`网关断开 ${mins} 分钟，已直发告警`);
+      log(`网关断开 ${mins} 分钟，已直发告警（诊断：${why}）`);
     }
+    // 【2026-11-07】断线唤醒监视：云端队列里有他的新讯息 = 他在喊我，
+    // 立即强制尝试唤醒本机会话（内部有 3 分钟限速）。这样他人在外面
+    // 回一句话就有机会把通道叫醒，不必等回家。
+    try {
+      const hres = await fetch(`${CLOUD_URL}/health`, { headers: cloudHeaders(), signal: AbortSignal.timeout(6000) });
+      if (hres.ok) {
+        const hj = await hres.json().catch(() => ({}));
+        const pend = Number(((hj.counts && (hj.counts.new || 0)) + (hj.counts && hj.counts.taken || 0)) || 0);
+        if (pend > 0) {
+          await tryWakeWorkBuddy(true);
+          if (Date.now() - lastSkipLogAt < 60000) log(`云端有 ${pend} 条讯息待处理，已触发本机唤醒尝试`);
+        }
+      }
+    } catch (_) { /* 云端探不到就走原有告警路径 */ }
     await sleep(15000);
     return [];
   }
@@ -1390,6 +1558,19 @@ async function awaitReply(runId) {
   throw lastErr;
 }
 
+// 【2026-11-07】模型供应商 500：WorkBuddy 会把供应商报错当成回复正文吐出来
+// （原文形如「Error: 500 the model provider is temporarily unavailable...」），
+// 桥接以前照抄就发出去 → Jack 的 tele 上冒出一串英文，还把他的问题吃掉了。
+// 现在识别出来：自动重投同一句；三次仍失败就抛 PROVIDER_DOWN，让上层交棒云端，
+// 绝不把英文报错原文丢给 Jack。
+function isProviderDown(s) {
+  const t = String(s || '').trim().replace(/^[`*>\s]+/, '');
+  if (!t || t.length > 400) return false;
+  if (/model provider is temporarily unavailable/i.test(t)) return true;
+  if (/^error[:\s]/i.test(t) && /(5\d\d|provider|unavailable|overloaded)/i.test(t)) return true;
+  return false;
+}
+
 // 投递一条讯息并取回回复（网关不可用时抛错）
 async function deliver(chatId, userId, text, convSuffix) {
   // 投递前先确认端口：WorkBuddy 一开新窗口就换端口，此刻必须是最新的
@@ -1401,23 +1582,36 @@ async function deliver(chatId, userId, text, convSuffix) {
       log('投递前重定位网关 -> ' + GW);
     }
   }
-  const runId = await withGateway(() => startRun(chatId, userId, text, convSuffix));
   // 关键：startRun 成功 = 讯息已真正进入 WorkBuddy（run 已创建）。
   // 此后若取回复失败，绝不能重投 —— 那会在 WorkBuddy 里产生重复的同一条讯息。
   // 用 delivered 标记把它和「压根没投进去」区分开。
-  try {
-    const text = await awaitReply(runId);
-    clearRun(runId);
-    return text;
-  } catch (e) {
-    // 【2026-10-21】取不到回复 = 这个 run 悬在服务端没结束。
-    // 不取消它，下一条消息就会被网关 429（僵尸占着「排队位」）——
-    // 今天 04:31 到 15:51 那七个小时的沉默就是这么来的。
-    await cancelRun(runId);
-    clearRun(runId);
-    const err = new Error('回复未取回: ' + ((e && e.message) || ''));
-    err.delivered = true;
-    throw err;
+  // 【2026-11-07】唯一例外：取回来的「回复」其实是供应商 500 报错，等于没答。
+  // 这种重投是安全的（WorkBuddy 里那条错误不会被 Jack 看到），最多重试 3 次。
+  const PD_RETRIES = 3;
+  for (let attempt = 1; attempt <= PD_RETRIES; attempt++) {
+    const runId = await withGateway(() => startRun(chatId, userId, text, convSuffix));
+    try {
+      const reply = await awaitReply(runId);
+      clearRun(runId);
+      if (isProviderDown(reply)) {
+        log(`模型供应商 500（第 ${attempt}/${PD_RETRIES} 次）→ 不发给用户：${reply.slice(0, 80)}`);
+        if (attempt < PD_RETRIES) { await sleep(12000); continue; }
+        const pe = new Error('PROVIDER_DOWN: ' + reply.slice(0, 120));
+        pe.providerDown = true;
+        throw pe;
+      }
+      return reply;
+    } catch (e) {
+      if (e && e.providerDown) throw e;
+      // 【2026-10-21】取不到回复 = 这个 run 悬在服务端没结束。
+      // 不取消它，下一条消息就会被网关 429（僵尸占着「排队位」）——
+      // 今天 04:31 到 15:51 那七个小时的沉默就是这么来的。
+      await cancelRun(runId);
+      clearRun(runId);
+      const err = new Error('回复未取回: ' + ((e && e.message) || ''));
+      err.delivered = true;
+      throw err;
+    }
   }
 }
 
@@ -1502,16 +1696,48 @@ async function handleMessage(msg, cloudId) {
 
   await tgSend(chatId, '收到，正在处理…');
 
+  // 【2026-11-06】网关有会话卡在「等授权」时换道：同一次卡死期间用同一个后缀，
+  // 这样这一串消息仍落在同一个新会话里，上下文不散；卡死解除后自动回到原会话。
+  let permEsc = '';
   try {
-    const reply = await deliver(chatId, userId, text);
+    if (await gwPermLocked()) {
+      permEsc = 'perm' + Math.floor(permLockFirstSeen / 1000) + (permEscSeq ? '.' + permEscSeq : '');
+      log(`网关授权卡死中 → 本条换道 ${permEsc} 投递`);
+    }
+  } catch (_) { permEsc = ''; }
+
+  try {
+    const reply = await deliver(chatId, userId, text, permEsc);
     if (!reply) {
       await tgSend(chatId, '（处理完成，但这次没有产出文字回复。）');
+      return true;
+    }
+    // 【2026-11-05】兜住「网关活着但没登录态」：这类网关 health 一定 200，
+    // 唯一破口是回复内容。发现即拉黑当前端口、重定位，绝不把报错原文丢给 Jack。
+    // 【2026-11-05 20:40 修正】第一版用 /AuthenticationRequiredError/ 全局匹配，
+    // 结果我自己在回答里引用这串英文（解释报错含义）时被误判成「网关没登录态」，
+    // 把好网关拉黑了，还白白交棒云端。现在只认「回复主体就是这句报错」：
+    // 去掉空白/反引号后必须以此开头，且整条回复很短（报错原文只有一行）。
+    const _rep = String(reply || '').trim().replace(/^[`*>\s]+/, '');
+    const _isAuthErr = _rep.length < 300 && /^AuthenticationRequiredError/i.test(_rep);
+    if (_isAuthErr) {
+      log(`网关 ${GW} 无登录态（回包含 AuthenticationRequiredError）→ 拉黑并重定位`);
+      markBadGw(GW);
+      const alt = await resolveGateway();
+      if (alt) {
+        GW = alt;
+        try { fs.writeFileSync(GW_HINT_FILE, GW.split(':').pop()); } catch (_) {}
+        log('已改用有登录态的网关 -> ' + GW);
+      }
+      await tgSend(chatId, '刚才是线路那头「没登录态」的旧进程抢了消息（不是你的账号问题），已自动切到正常的。麻烦把原话再发一次，我马上答。');
       return true;
     }
     await tgSend(chatId, reply);
     log(`已回复 ${chatId}: ${reply.slice(0, 80)}`);
     return true;
   } catch (e) {
+    // 【2026-11-06】换道也没拿到回复 → 下一条再换一条新会话，避免死在同一把锁上
+    if (permEsc) permEscSeq += 1;
     if (e.delivered) {
       // 讯息已真正送达并处理，只是回复没取回 —— 绝不重投（会重复）
       // 【2026-10-12】补上真因，否则永远不知道是超时、断流还是 Agent 自身报错。
@@ -1614,7 +1840,11 @@ async function handleMessage(msg, cloudId) {
       return true;
     } else {
       log('处理失败: ' + e.message);
-      await tgSend(chatId, '处理出错：' + e.message);
+      // 【2026-11-07】绝不把英文报错原文丢给 Jack（他看不懂，也等于没答）
+      const pd = (e && e.providerDown) || /PROVIDER_DOWN/.test((e && e.message) || '');
+      await tgSend(chatId, pd
+        ? '我这边模型服务刚抽风了一下（连续三次返回 500），这条没答上来。不是你的问题，隔一两分钟把原话再发一次就行。'
+        : '处理出错，原因：' + ((e && e.message) || e));
       return true;
     }
   }
@@ -1678,20 +1908,37 @@ let lastWakeAt = 0;
 
 function workbuddyRunning() {
   try {
-    const out = execFileSync('/usr/bin/pgrep', ['-f', 'WorkBuddy.app/Contents/MacOS/Electron'],
-      { encoding: 'utf8', timeout: 8000 });
-    return out.trim().length > 0;
+    const out = execFileSync('/bin/ps', ['-eo', 'command='], { encoding: 'utf8', timeout: 8000 });
+    // 【2026-11-04 修复】旧实现用 pgrep -f 匹配二进制路径，WorkBuddy 主窗口退出后残留的
+    // 守护/边车进程（daemon-app-server-entry、sidecar 等，命令行同样含 Electron 路径）
+    // 会被误判成「应用还在跑」→ 拉起逻辑被跳过 → 05:10 应用退出后拖到 09:05 才被拉起，
+    // tele 断了近 4 小时。主窗口进程的特征：命令行就是二进制路径本身、后面没有任何参数。
+    const BIN = '/Applications/WorkBuddy.app/Contents/MacOS/Electron';
+    return out.split('\n').some((line) => line.trim() === BIN);
   } catch (_) {
-    return false; // pgrep 无匹配 = 没在跑
+    return false; // ps 无匹配 = 没在跑
   }
 }
 
-async function tryWakeWorkBuddy() {
+async function tryWakeWorkBuddy(force = false) {
   const now = Date.now();
   if (!gwDownSince) { gwDownSince = now; return; }
-  if (now - gwDownSince < 90000 || now - lastWakeAt < 180000) return;
+  if (!force && now - gwDownSince < 90000) return;
+  if (now - lastWakeAt < 180000) return;
   lastWakeAt = now;
-  if (workbuddyRunning()) return; // 在跑只是网关没就绪，等它自己起
+  if (workbuddyRunning()) {
+    // 【2026-11-07 新对策】假死：应用在跑但网关没了 = 界面里一个对话都没开。
+    // 以前这里直接 return 干等，断过 7 小时；现在激活窗口让应用自己唤回会话，
+    // 并配合「云端有新讯息就强制唤醒」（见 cloudGetUpdates），Jack 在外面
+    // 回一句话也能触发唤醒，不用再等他到家。
+    try {
+      execFileSync('/usr/bin/open', ['-a', 'WorkBuddy'], { timeout: 15000 });
+      log('通道自养：WorkBuddy 假死（在跑但无网关），已激活窗口尝试唤回会话');
+    } catch (e) {
+      log('通道自养：激活 WorkBuddy 失败: ' + ((e && e.message) || e));
+    }
+    return;
+  }
   try {
     execFileSync('/usr/bin/open', ['-a', 'WorkBuddy'], { timeout: 15000 });
     log('通道自养：WorkBuddy 不在运行，已自动拉起（等待网关就绪）');
@@ -1707,7 +1954,11 @@ async function main() {
     GW = found;
     try { fs.writeFileSync(GW_HINT_FILE, GW.split(':').pop()); } catch (_) {}
   } else {
-    log('警告：启动时未能定位本机网关，将在收到讯息时重试定位。');
+    log('警告：启动时未能定位本机网关，先试兜底网关。');
+    if (await ensureFallbackGateway()) {
+      GW = fbBase();
+      log('已切换到兜底网关 ' + GW);
+    }
   }
   // 先把上一个进程遗留的 run 清掉：僵尸不清，本进程投什么都会被 429 挡回
   if (found) await sweepOrphanRun();
@@ -1771,7 +2022,14 @@ async function main() {
             try { fs.writeFileSync(GW_HINT_FILE, GW.split(':').pop()); } catch (_) {}
             log('网关端口变化，已重新定位到 ' + GW);
           } else if (!found) {
-            await tryWakeWorkBuddy();
+            // 界面里没有对话 = 没有网关。先试兜底网关，实在不行再拉起 WorkBuddy
+            if (await ensureFallbackGateway()) {
+              GW = fbBase();
+              gwDownSince = 0;
+              log('已切换到兜底网关 ' + GW);
+            } else {
+              await tryWakeWorkBuddy();
+            }
           }
         } else {
           gwDownSince = 0;

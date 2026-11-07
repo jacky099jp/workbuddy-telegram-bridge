@@ -1883,9 +1883,26 @@ async function handleMessage(msg, cloudId) {
             log(`第 ${i} 次重试仍受阻（${e2.message}）: ${text.slice(0, 30)}`);
           }
         }
-        log(`本机接不了，主动交棒给云端: ${text.slice(0, 40)}`);
-        await cloudHandoff(cloudId);
-        return false;
+        if (CLOUD_MODE) {
+          log(`本机接不了，主动交棒给云端: ${text.slice(0, 40)}`);
+          await cloudHandoff(cloudId);
+          return false;
+        }
+        // 【2026-11-07 拆掉云端后】没有云端可以交棒 —— 绝不能静默丢。
+        // 之前这里在直连模式下 cloudHandoff(undefined) 直接 return，
+        // 消息就这样消失了（22:50 那条「我不需要雲端」连试 3 次之后无声无息）。
+        // 现在改成：进待补发队列（2 小时窗口、逐步退避），并说明在排队。
+        log(`连试 ${CLOUD_HANDOFF_RETRIES} 次都送不进网关，转入待补发队列: ${text.slice(0, 40)}`);
+        const dup2 = pending.find((p) => p.chatId === chatId && p.text === text &&
+                                          Date.now() - (p.at || 0) < 10 * 60 * 1000);
+        if (!dup2) {
+          pending.push({ chatId, userId, text, at: Date.now(), tries: 1 });
+          savePending(pending);
+        }
+        try {
+          await tgSend(chatId, '网关正忙，这条我先收着排队，空出来自动处理，不用再发一次。');
+        } catch (_) {}
+        return true;
       }
       // 网关还没就绪：排队，稍后自动补发，绝不丢弃。
       // 同一句话 10 分钟内只留一条：他着急时会连发同样的问话，

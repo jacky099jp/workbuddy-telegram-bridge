@@ -1626,8 +1626,69 @@ async function deliver(chatId, userId, text, convSuffix) {
       clearRun(runId);
       const err = new Error('回复未取回: ' + ((e && e.message) || ''));
       err.delivered = true;
+      err.runId = runId;
+      err.base = GW;
       throw err;
     }
+  }
+}
+
+// 【2026-11-07】回复取不回时，先判断那个 run 到底死没死，别再叫 Jack「麻煩把原話再發一次」。
+// 判据（任一成立即视为已死 → 原话重投是安全的，旧 run 不会再产出，不会重复回）：
+//   ① 网关实例已经换了（端口/密钥一起换 = WorkBuddy 重启，旧 run 随旧实例消失）
+//   ② 当初那个网关地址已经探不通
+//   ③ 查不到这个 run 或它已不在 active 状态
+async function runStillAlive(base, runId) {
+  if (!base || !runId) return false;
+  try {
+    if (base !== GW) return false;
+    const secret = readSecret();
+    if (!secret) return false;
+    const res = await fetch(`${base}/api/v1/runs/${runId}`, {
+      headers: { 'x-access-token': secret, 'x-codebuddy-request': '1' },
+      signal: AbortSignal.timeout(4000),
+    });
+    if (res.status === 404) return false;
+    if (!res.ok) return false;
+    const j = await res.json().catch(() => null);
+    const d = (j && j.data) || j || {};
+    if (typeof d.active === 'boolean') return d.active;
+    const st = String(d.status || '');
+    return /active|running|queued|pending|waiting/i.test(st);
+  } catch (_) {
+    return false;
+  }
+}
+
+// 回复丢了之后的自救：能确认旧 run 已死就自己重跑一次，不让 Jack 重复打字。
+// 返回 true = 已经处理完（答了或者明确告知）；false = 交给外层兜底。
+async function recoverLost(chatId, userId, text, err, tag) {
+  let alive = false;
+  try { alive = await runStillAlive(err && err.base, err && err.runId); } catch (_) {}
+  if (alive) {
+    // 老 run 还在跑：不重投（重投会让同一件事做两遍），只告诉他还在处理
+    log(`[${tag}] 旧 run 仍 active，不重投，等待中: ${text.slice(0, 30)}`);
+    try {
+      await tgSend(chatId, '这条还在我手上跑，没丢。跑完我直接发结果，不用再发一次。');
+    } catch (_) {}
+    return true;
+  }
+  log(`[${tag}] 旧 run 已随实例消失，自动重跑一次（无需 Jack 重发）: ${text.slice(0, 30)}`);
+  try {
+    const esc = 're' + Math.floor(Date.now() / 1000);
+    const r = await deliver(chatId, userId, text, esc);
+    await tgSend(chatId, r || '（处理完成，但这次没有产出文字回复。）');
+    log(`[${tag}] 自动重跑成功: ${text.slice(0, 30)}`);
+    return true;
+  } catch (e2) {
+    if (e2 && e2.delivered) {
+      try {
+        await tgSend(chatId, '通道又换了一次实例，这条还是没接住。你说一句「重来」，我立刻再跑；不想重打就直接说事。');
+      } catch (_) {}
+      return true;
+    }
+    log(`[${tag}] 自动重跑失败（${e2 && e2.message}）: ${text.slice(0, 30)}`);
+    return false;
   }
 }
 
@@ -1798,8 +1859,7 @@ async function handleMessage(msg, cloudId) {
             return true;
           } catch (e1) {
             if (e1.delivered) {
-              await tgSend(chatId, '这条我收到了，AI 也开始处理了，但回复回传时通道断线，结果拿不回来。麻烦把原话再发一次，我马上重新答。');
-              return true;
+              return await recoverLost(chatId, userId, text, e1, '换道后丢失');
             }
             log(`换道逃生仍失败（${e1.message}）: ${text.slice(0, 30)}`);
           }
@@ -1814,9 +1874,8 @@ async function handleMessage(msg, cloudId) {
             return true;
           } catch (e2) {
             if (e2.delivered) {
-              log(`重试时确认已送达（回复未取回，真因: ${((e2 && e2.message) || e2).slice(0, 180)}），不再重投: ${text.slice(0, 40)}`);
-              await tgSend(chatId, '这条我收到了，AI 也开始处理了，但回复回传时通道断线，结果拿不回来。麻烦把原话再发一次，我马上重新答。');
-              return true;
+              log(`重试时确认已送达（回复未取回，真因: ${((e2 && e2.message) || e2).slice(0, 180)}），转入自查: ${text.slice(0, 40)}`);
+              return await recoverLost(chatId, userId, text, e2, '重试后丢失');
             }
             if (!isTransientErr(e2)) return true;
             log(`第 ${i} 次重试仍受阻（${e2.message}）: ${text.slice(0, 30)}`);

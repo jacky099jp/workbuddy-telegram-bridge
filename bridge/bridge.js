@@ -1064,13 +1064,10 @@ function isAutomationBase(base, skipSet) {
 }
 
 // 定位可用网关：提示文件 → 当前 GW → config → 扫描监听端口
-async function resolveGateway() {
+async function resolveGatewayOnce() {
   // 一次性算出自动化端口集合，避免每个候选都重新扫一遍 ps
   const skipAuto = automationPorts();
   const ok = async (base) => !!base && !isBadGw(base) && !isAutomationBase(base, skipAuto) && await probeHealth(base);
-
-  // 密钥过期会让所有探测失败；WorkBuddy 重启后先尝试自愈一次
-  if (!(await ok(readGwHint() || GW))) tryRefreshSecret();
 
   const hint = readGwHint();
   if (await ok(hint)) return hint;
@@ -1085,6 +1082,22 @@ async function resolveGateway() {
     if (base === GW || base === hint) continue;
     if (skipAuto.has(String(p))) continue;
     if (await probeHealth(base)) return base;
+  }
+  return null;
+}
+
+async function resolveGateway() {
+  const first = await resolveGatewayOnce();
+  if (first) return first;
+  // 【2026-11-07】全端口都探不通，最常见的原因是密钥过期：
+  // WorkBuddy 一旦起新实例，网关端口和密钥会同时换，旧密钥探新端口全是 401。
+  // 所以失败后强制收割一次密钥（含端口提示），再完整扫一遍。
+  if (tryRefreshSecret()) {
+    const second = await resolveGatewayOnce();
+    if (second) {
+      log('收割密钥后重新定位网关 -> ' + second);
+      return second;
+    }
   }
   return null;
 }
@@ -1540,14 +1553,17 @@ async function awaitReply(runId) {
       // Agent 自身报错是终态，重连没有意义
       if (/Agent 执行失败|BAD_SECRET|NO_SECRET/.test(m)) throw e;
       if (attempt <= REPLY_STREAM_RETRIES) {
-        log(`回复流中断（第 ${attempt} 次）：${m}；${REPLY_STREAM_GAP_MS / 1000} 秒后重连拉取`);
+        // 【2026-11-07】前 3 次快速重试（4 秒）：断流多发生在端口刚好漂移的瞬间，
+        // 快速重连能赶在新实例就绪时立刻接上；后面才退到 10 秒，避免无谓等待把队列堵死。
+        const gap = attempt <= 3 ? 4000 : REPLY_STREAM_GAP_MS;
+        log(`回复流中断（第 ${attempt} 次）：${m}；${gap / 1000} 秒后重连拉取`);
         const found = await resolveGateway();
         if (found && found !== GW) {
           GW = found;
           try { fs.writeFileSync(GW_HINT_FILE, GW.split(':').pop()); } catch (_) {}
           log('重连前重定位网关 -> ' + GW);
         }
-        await sleep(REPLY_STREAM_GAP_MS);
+        await sleep(gap);
       }
     }
   }
